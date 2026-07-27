@@ -14,11 +14,11 @@ import (
 	"os"
 	"runtime"
 
-	"github.com/fables-for-robots/amber-store-core/amberignore"
-	"github.com/fables-for-robots/amber-store-core/chunkers"
-	"github.com/fables-for-robots/amber-store-core/fstree"
-	"github.com/fables-for-robots/amber-store-core/key"
-	"github.com/fables-for-robots/amber-store-core/packstore"
+	"github.com/jobs-build/amber-store-core/amberignore"
+	"github.com/jobs-build/amber-store-core/chunkers"
+	"github.com/jobs-build/amber-store-core/fstree"
+	"github.com/jobs-build/amber-store-core/key"
+	"github.com/jobs-build/amber-store-core/packstore"
 )
 
 // DefaultItemBits is the item-chunker bit width used when Opts leaves it zero:

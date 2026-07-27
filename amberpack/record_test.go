@@ -9,7 +9,7 @@ import (
 	"math/rand/v2"
 	"testing"
 
-	"github.com/fables-for-robots/amber-store-core/key"
+	"github.com/jobs-build/amber-store-core/key"
 )
 
 // incompressible returns n deterministic pseudo-random bytes (zstd cannot shrink them).

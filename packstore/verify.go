@@ -6,8 +6,8 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/fables-for-robots/amber-store-core/amberpack"
-	"github.com/fables-for-robots/amber-store-core/key"
+	"github.com/jobs-build/amber-store-core/amberpack"
+	"github.com/jobs-build/amber-store-core/key"
 	"github.com/zeebo/blake3"
 )
 

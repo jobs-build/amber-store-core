@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/fables-for-robots/amber-store-core/fstree"
-	"github.com/fables-for-robots/amber-store-core/reference"
+	"github.com/jobs-build/amber-store-core/fstree"
+	"github.com/jobs-build/amber-store-core/reference"
 )
 
 // testKey returns a valid canonical key to point references at.

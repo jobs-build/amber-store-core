@@ -7,7 +7,7 @@ import (
 	"hash/crc32"
 	"math"
 
-	"github.com/fables-for-robots/amber-store-core/key"
+	"github.com/jobs-build/amber-store-core/key"
 	"github.com/klauspost/compress/zstd"
 )
 

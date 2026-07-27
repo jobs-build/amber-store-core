@@ -13,8 +13,8 @@ import (
 	"testing"
 
 	"github.com/FastFilter/xorfilter"
-	"github.com/fables-for-robots/amber-store-core/amberpack"
-	"github.com/fables-for-robots/amber-store-core/key"
+	"github.com/jobs-build/amber-store-core/amberpack"
+	"github.com/jobs-build/amber-store-core/key"
 )
 
 // testEntries builds n index entries with distinct keys and synthetic offsets.

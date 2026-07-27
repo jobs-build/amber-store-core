@@ -7,9 +7,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/fables-for-robots/amber-store-core/amberignore"
-	"github.com/fables-for-robots/amber-store-core/chunkers"
-	"github.com/fables-for-robots/amber-store-core/key"
+	"github.com/jobs-build/amber-store-core/amberignore"
+	"github.com/jobs-build/amber-store-core/chunkers"
+	"github.com/jobs-build/amber-store-core/key"
 	"golang.org/x/sys/unix"
 )
 

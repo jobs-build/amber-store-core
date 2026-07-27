@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/fables-for-robots/amber-store-core/key"
+	"github.com/jobs-build/amber-store-core/key"
 )
 
 // LookupEntry returns the entry called name in the directory object dir. It

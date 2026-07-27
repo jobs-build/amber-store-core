@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/fables-for-robots/amber-store-core/chunkers"
-	"github.com/fables-for-robots/amber-store-core/ingest"
+	"github.com/jobs-build/amber-store-core/chunkers"
+	"github.com/jobs-build/amber-store-core/ingest"
 	"github.com/urfave/cli/v2"
 )
 

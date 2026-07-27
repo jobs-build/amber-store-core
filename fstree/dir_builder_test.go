@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/fables-for-robots/amber-store-core/chunkers"
-	"github.com/fables-for-robots/amber-store-core/key"
+	"github.com/jobs-build/amber-store-core/chunkers"
+	"github.com/jobs-build/amber-store-core/key"
 )
 
 func TestDir_EmptyDirIsSingleEmptyLeaf(t *testing.T) {

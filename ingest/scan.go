@@ -6,7 +6,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/fables-for-robots/amber-store-core/amberignore"
+	"github.com/jobs-build/amber-store-core/amberignore"
 )
 
 // Scan walks the directory tree at dir concurrently (ReadDir + Lstat only, no

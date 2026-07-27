@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/fables-for-robots/amber-store-core/key"
-	"github.com/fables-for-robots/amber-store-core/reference"
+	"github.com/jobs-build/amber-store-core/key"
+	"github.com/jobs-build/amber-store-core/reference"
 	"github.com/urfave/cli/v2"
 )
 

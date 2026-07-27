@@ -151,7 +151,7 @@ go build ./...
 go test ./...
 ```
 
-- Module: `github.com/fables-for-robots/amber-store-core`
+- Module: `github.com/jobs-build/amber-store-core`
 - Go: 1.26+
 
 ## License

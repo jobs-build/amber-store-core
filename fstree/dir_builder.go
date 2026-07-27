@@ -1,8 +1,8 @@
 package fstree
 
 import (
-	"github.com/fables-for-robots/amber-store-core/chunkers"
-	"github.com/fables-for-robots/amber-store-core/key"
+	"github.com/jobs-build/amber-store-core/chunkers"
+	"github.com/jobs-build/amber-store-core/key"
 )
 
 // DirBuilder builds one directory's prolly tree by streaming its entries (which
