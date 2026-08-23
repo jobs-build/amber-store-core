@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 
+	"github.com/jobs-build/amber-store-core/gc"
 	"github.com/jobs-build/amber-store-core/packstore"
 	"github.com/jobs-build/amber-store-core/refstore"
 	"github.com/urfave/cli/v2"
@@ -19,7 +20,8 @@ func openStore(c *cli.Context) (*packstore.Store, *refstore.Store, error) {
 	if dir == "" {
 		return nil, nil, fmt.Errorf("no store directory: set --store or $AMBER_STORE")
 	}
-	objects, err := packstore.Open(filepath.Join(dir, "packstore"), packstore.WithSync(true))
+	objects, err := packstore.Open(filepath.Join(dir, "packstore"),
+		packstore.WithSync(true), packstore.WithSegmentSize(c.Int64("segment-size")))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -34,4 +36,10 @@ func openStore(c *cli.Context) (*packstore.Store, *refstore.Store, error) {
 // closeStore closes both halves, keeping every error.
 func closeStore(objects *packstore.Store, refs *refstore.Store) error {
 	return errors.Join(refs.Close(), objects.Close())
+}
+
+// openCollector opens the collector next to an already-open store pair;
+// <dir>/closures holds the closure files. Close it before closeStore.
+func openCollector(c *cli.Context, objects *packstore.Store, refs *refstore.Store, opts gc.Options) (*gc.Collector, error) {
+	return gc.Open(filepath.Join(c.String("store"), "closures"), objects, refs, opts)
 }
