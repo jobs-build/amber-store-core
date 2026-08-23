@@ -144,6 +144,34 @@ func (c *Collector) Close() error {
 	return c.d.close()
 }
 
+// Wipe cancels a running cycle and empties closures/ and the union. It
+// accompanies packstore.Wipe and refstore.Wipe, which the caller runs
+// first; afterwards the collector is empty but usable.
+//
+// walking is deliberately left untouched: its entries belong to PrepareRef
+// calls currently walking a root (concurrent with this Wipe, racing the
+// caller's packstore/refstore wipe), and clearing it here would let such a
+// walk's cleanup underflow or delete a closure file out from under a
+// different in-flight walk of the same root.
+func (c *Collector) Wipe() error {
+	c.mu.Lock()
+	if c.cancelCycle != nil {
+		c.cancelCycle()
+	}
+	c.mu.Unlock()
+	c.cycleMu.Lock() // wait out the cancelled cycle
+	defer c.cycleMu.Unlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.roots = make(map[key.Key]int)
+	c.pending = make(map[key.Key]bool)
+	c.leases = make(map[*Lease]bool)
+	c.union.Store(buildUnion(nil))
+	c.last, c.lastErr = nil, nil
+	c.haveLast = false
+	return c.d.wipe()
+}
+
 // walk computes root's closure: the tails of every key CheckComplete
 // visits. A missing object surfaces as the walk error — the caller's 404.
 func (c *Collector) walk(root key.Key) ([]uint64, error) {
