@@ -84,6 +84,25 @@ func TestClosureRejects(t *testing.T) {
 			b = binary.BigEndian.AppendUint64(b, 7)
 			return binary.BigEndian.AppendUint32(b, crc32Of(b)), root
 		},
+		"count overflow": func() ([]byte, key.Key) {
+			// count = 1<<61 so 8*count overflows to 0 mod 2^64: closureHead
+			// (48) + 8*count + 4 wraps to exactly 52, matching this
+			// 52-byte buffer's real length, with a correctly recomputed
+			// CRC over the 48-byte prefix. Must not panic on decode.
+			b := make([]byte, 0, closureHead+4)
+			b = append(b, closureMagic...)
+			b = append(b, root[:]...)
+			b = binary.BigEndian.AppendUint64(b, 1<<61)
+			b = binary.BigEndian.AppendUint32(b, crc32Of(b))
+			return b, root
+		},
+		"below minimum": func() ([]byte, key.Key) {
+			// Shorter than closureHead+4: exercises the first guard
+			// directly, distinct from "truncated" (which trims a
+			// full-sized closure by a few bytes but stays above the
+			// minimum).
+			return good[:20], root
+		},
 	}
 	for name, mk := range cases {
 		b, r := mk()

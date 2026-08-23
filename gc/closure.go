@@ -52,7 +52,14 @@ func decodeClosure(root key.Key, b []byte) ([]uint64, error) {
 		return nil, errBadClosure
 	}
 	count := binary.BigEndian.Uint64(b[len(closureMagic)+key.Size : closureHead])
-	if uint64(len(b)) != uint64(closureHead)+8*count+4 {
+	// Derive the expected count from the buffer's actual size rather than
+	// multiplying the attacker-controlled count by 8: count is a u64 read
+	// straight from the file, and 8*count can overflow and wrap back to a
+	// value that spuriously matches len(b) (see architecture/simple-gc.md
+	// and the fix report in task-7-report.md for the crafted 52-byte
+	// input this guards against).
+	remaining := uint64(len(b)) - uint64(closureHead) - 4 // safe: len(b) >= closureHead+4, checked above
+	if remaining%8 != 0 || count != remaining/8 {
 		return nil, errBadClosure
 	}
 	if crc32.Checksum(b[:len(b)-4], castagnoli) != binary.BigEndian.Uint32(b[len(b)-4:]) {
