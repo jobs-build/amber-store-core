@@ -1,6 +1,7 @@
 package packstore
 
 import (
+	"bytes"
 	"errors"
 	"math"
 	"os"
@@ -166,5 +167,109 @@ func TestRecordCorrupt(t *testing.T) {
 	}
 	if _, err := s.Record(segs[0].ID, 8); !errors.Is(err, ErrCorrupt) {
 		t.Errorf("Record of corrupt payload: err = %v, want ErrCorrupt", err)
+	}
+}
+
+func TestHasOutside(t *testing.T) {
+	objs := testObjects(t, 24)
+	s := gcStore(t, objs)
+	segs, err := s.Segments()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(segs) < 2 {
+		t.Fatal("need at least two sealed segments")
+	}
+	// Each key lives in exactly one segment (Put dedups), so a key found in
+	// segment A is not outside A, and is outside any other segment.
+	first := segs[0]
+	var someKey key.Key
+	if err := s.ScanIndex(first.ID, func(k key.Key, _ uint64, _ uint32) { someKey = k }); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := s.HasOutside(first.ID, someKey); err != nil || ok {
+		t.Errorf("HasOutside(own segment) = %v, %v; want false, nil", ok, err)
+	}
+	if ok, err := s.HasOutside(segs[1].ID, someKey); err != nil || !ok {
+		t.Errorf("HasOutside(other segment) = %v, %v; want true, nil", ok, err)
+	}
+	// After re-appending the record, the key exists in the active segment
+	// too, so it is outside its original segment.
+	var off uint64
+	if err := s.ScanIndex(first.ID, func(k key.Key, o uint64, _ uint32) {
+		if k == someKey {
+			off = o
+		}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := s.Record(first.ID, off)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AppendRecord(someKey, raw); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if ok, err := s.HasOutside(first.ID, someKey); err != nil || !ok {
+		t.Errorf("HasOutside after copy = %v, %v; want true, nil", ok, err)
+	}
+}
+
+func TestAppendRecordValidates(t *testing.T) {
+	// 8 objects, not 6: testObjects alternates highly-compressible
+	// (~78-byte record) and incompressible (~2048-byte record) payloads,
+	// so 6 would stay under the 8 KiB rotation threshold and never seal
+	// (see TestRecordCorrupt); 8 crosses it deterministically.
+	s := gcStore(t, testObjects(t, 8))
+	segs, err := s.Segments()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var k key.Key
+	var off uint64
+	if err := s.ScanIndex(segs[0].ID, func(kk key.Key, o uint64, _ uint32) { k, off = kk, o }); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := s.Record(segs[0].ID, off)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Wrong key.
+	other := blobObj(t, []byte("other-payload"))
+	if err := s.AppendRecord(other.Key, raw); !errors.Is(err, ErrCorrupt) {
+		t.Errorf("mismatched key: err = %v, want ErrCorrupt", err)
+	}
+	// Corrupt payload.
+	bad := append([]byte(nil), raw...)
+	bad[len(bad)-1] ^= 0xFF
+	if err := s.AppendRecord(k, bad); !errors.Is(err, ErrCorrupt) {
+		t.Errorf("corrupt raw: err = %v, want ErrCorrupt", err)
+	}
+	// Trailing junk.
+	long := append(append([]byte(nil), raw...), 0)
+	if err := s.AppendRecord(k, long); !errors.Is(err, ErrCorrupt) {
+		t.Errorf("overlong raw: err = %v, want ErrCorrupt", err)
+	}
+	// Valid append round-trips through Get.
+	if err := s.AppendRecord(k, raw); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.Get(k)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec, err := amberpack.ParseRecord(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want, err := amberpack.DecodePayload(rec.Flags, rec.Ulen, raw[amberpack.RecHeaderSize:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Error("payload mismatch after AppendRecord")
 	}
 }

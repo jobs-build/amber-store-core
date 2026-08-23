@@ -110,3 +110,51 @@ func (s *Store) Record(id, off uint64) ([]byte, error) {
 	copy(out, seg.mm[off:end])
 	return out, nil
 }
+
+// HasOutside reports whether k is stored anywhere but segment id: the
+// active segment or any other sealed segment. Reaping uses it to skip
+// records that already survived.
+func (s *Store) HasOutside(id uint64, k key.Key) (bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.closed {
+		return false, ErrClosed
+	}
+	if s.active != nil {
+		if _, ok := s.active.index[k]; ok {
+			return true, nil
+		}
+	}
+	for i := len(s.sealed) - 1; i >= 0; i-- {
+		if s.sealed[i].id == id {
+			continue
+		}
+		if s.sealed[i].has(k) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// AppendRecord re-appends an already-encoded record through the normal
+// append path: no decode, no re-encode, no fsync — callers batch appends
+// and call Sync. raw must be exactly one record, CRC-valid, keyed k.
+func (s *Store) AppendRecord(k key.Key, raw []byte) error {
+	rec, err := amberpack.ParseRecord(raw)
+	if err != nil {
+		return err
+	}
+	if rec.Key != k {
+		return fmt.Errorf("%w: record key %s does not match %s", ErrCorrupt, rec.Key, k)
+	}
+	if len(raw) != amberpack.RecHeaderSize+int(rec.Slen) {
+		return fmt.Errorf("%w: record is %d bytes, want %d", ErrCorrupt, len(raw), amberpack.RecHeaderSize+int(rec.Slen))
+	}
+	return s.append(k, raw, false)
+}
+
+// Sync fsyncs the active segment, making every append so far durable —
+// AppendRecord batches end with one Sync.
+func (s *Store) Sync() error {
+	return s.syncActive()
+}
