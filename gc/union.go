@@ -1,7 +1,9 @@
 // The union of all closures: every live tail and the number of references
-// reaching it, ≈12 B per live object. Immutable; merges build a fresh union
-// that is swapped in. Membership is a binary search under a 64 Ki-entry
-// fanout on the top tail bits.
+// reaching it, ≈12 B per live object plus a fixed 256 KiB fanout per union.
+// Immutable; merges build a fresh union that is swapped in. Membership is a
+// binary search under a 64 Ki-entry fanout on the top tail bits. Fanout
+// offsets are uint32, so a union holds at most 2^32 entries (~51 GB —
+// unreachable in practice).
 
 package gc
 
@@ -59,8 +61,10 @@ func (u *union) contains(t uint64) bool {
 }
 
 // merge returns a fresh union with delta applied to every tail in tails
-// (sorted, deduplicated): one O(union) sequential pass. Counts reaching
-// zero drop out; a negative delta on an absent tail is ignored.
+// (sorted, deduplicated): one sequential pass over the union, plus a fixed
+// fanout rebuild (65 536 buckets, ~256 KiB) — merges cost the same for tiny
+// unions as the pass itself does for big ones. Counts reaching zero drop
+// out; a negative delta on an absent tail is ignored.
 func (u *union) merge(tails []uint64, delta int32) *union {
 	nu := &union{
 		tails:  make([]uint64, 0, len(u.tails)+len(tails)),
