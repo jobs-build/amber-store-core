@@ -96,7 +96,9 @@ func (s *Store) Record(id, off uint64) ([]byte, error) {
 	}
 	defer s.scrubs.Done()
 	body := uint64(seg.fv.bodyLen)
-	if off < uint64(len(magicHeader)) || off+amberpack.RecHeaderSize > body {
+	// Overflow-safe: off may come from a crafted index; off+RecHeaderSize
+	// could wrap. Same shape as the sealed-segment readers in footer.go.
+	if off < uint64(len(magicHeader)) || off > body || uint64(amberpack.RecHeaderSize) > body-off {
 		return nil, fmt.Errorf("%w: %s: record offset %d out of range", ErrCorrupt, seg.path, off)
 	}
 	rec, err := amberpack.ParseRecord(seg.mm[off:body])

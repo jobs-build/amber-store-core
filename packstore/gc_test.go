@@ -2,6 +2,7 @@ package packstore
 
 import (
 	"errors"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -110,6 +111,13 @@ func TestRecordRoundTrip(t *testing.T) {
 	}
 	if _, err := s.Record(segs[0].ID, 1<<40); err == nil {
 		t.Error("Record far out of range should fail")
+	}
+	// Offsets in the wrap window: off+RecHeaderSize overflows uint64. A
+	// naive bounds check passes them and the mmap slice panics.
+	for _, off := range []uint64{math.MaxUint64, math.MaxUint64 - 40} {
+		if _, err := s.Record(segs[0].ID, off); !errors.Is(err, ErrCorrupt) {
+			t.Errorf("Record at wrapping offset %d: err = %v, want ErrCorrupt", off, err)
+		}
 	}
 	// A CRC-corrupt record is reported: flip one payload byte via the mmap?
 	// The mmap is read-only; instead corrupt the file on disk of a closed
