@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/jobs-build/amber-store-core/amberpack"
 	"github.com/jobs-build/amber-store-core/key"
@@ -95,6 +96,9 @@ type Store struct {
 	scrubMu sync.Mutex
 	scrubN  int
 	scrubC  *sync.Cond
+
+	writesMu sync.Mutex
+	writes   map[*writeToken]time.Time // in-flight Put/WriteBatch/WriteParallel starts
 }
 
 // beginScrub registers a lock-free mmap walk. Call while holding mu.RLock
@@ -147,7 +151,7 @@ func Open(dir string, opts ...Option) (*Store, error) {
 		dirF.Close()
 		return nil, fmt.Errorf("packstore: %s is already open: %w", dir, err)
 	}
-	s := &Store{dir: dir, dirF: dirF, cfg: cfg, nextID: 1}
+	s := &Store{dir: dir, dirF: dirF, cfg: cfg, nextID: 1, writes: make(map[*writeToken]time.Time)}
 	s.scrubC = sync.NewCond(&s.scrubMu)
 	if err := s.load(); err != nil {
 		s.releaseDir()
@@ -451,6 +455,8 @@ func (s *Store) sealActiveLocked() error {
 // returns an error after appending part of the batch, it best-effort fsyncs
 // that prefix first, so Has-visible records never stay non-durable.
 func (s *Store) WriteBatch(seq iter.Seq2[Object, error]) error {
+	w := s.beginWrite()
+	defer s.endWrite(w)
 	seen := make(map[key.Key]struct{})
 	appended := false
 	fail := func(err error) error {
@@ -490,6 +496,8 @@ func (s *Store) WriteBatch(seq iter.Seq2[Object, error]) error {
 // A dedup hit returns success without fsyncing; if the matching record was
 // appended by a still-running batch, its durability rides on that batch's commit.
 func (s *Store) Put(k key.Key, data []byte) error {
+	w := s.beginWrite()
+	defer s.endWrite(w)
 	s.mu.RLock()
 	failed := s.failed
 	s.mu.RUnlock()

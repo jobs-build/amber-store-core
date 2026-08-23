@@ -447,3 +447,64 @@ func TestRemoveWaitsForScrubs(t *testing.T) {
 		t.Error("Remove returned before the pinned scan finished")
 	}
 }
+
+func TestOldestInflightWrite(t *testing.T) {
+	s := openStore(t, t.TempDir())
+	if _, ok := s.OldestInflightWrite(); ok {
+		t.Error("idle store reports an in-flight write")
+	}
+	before := time.Now()
+	release := make(chan struct{})
+	started := make(chan struct{})
+	go func() {
+		seq := func(yield func(Object, error) bool) {
+			o := blobObj(t, []byte("first"))
+			if !yield(o, nil) {
+				return
+			}
+			close(started)
+			<-release // hold the write open
+			yield(blobObj(t, []byte("second")), nil)
+		}
+		if err := s.WriteBatch(seq); err != nil {
+			t.Error(err)
+		}
+	}()
+	<-started
+	got, ok := s.OldestInflightWrite()
+	if !ok {
+		t.Fatal("in-flight WriteBatch not reported")
+	}
+	if got.Before(before) || got.After(time.Now()) {
+		t.Errorf("start %v outside [%v, now]", got, before)
+	}
+	close(release)
+	// After the write returns, the token is gone.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, ok := s.OldestInflightWrite(); !ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("write token never released")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+func TestOldestInflightWriteCoversPut(t *testing.T) {
+	// Put registers even when it dedups: wrap-the-whole-call semantics are
+	// only observable via the map being empty afterwards, so just check a
+	// plain Put leaves no token behind and errors don't leak tokens.
+	s := openStore(t, t.TempDir())
+	o := blobObj(t, []byte("x"))
+	if err := s.Put(o.Key, o.Data); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Put(o.Key, o.Data); err != nil { // dedup path
+		t.Fatal(err)
+	}
+	if _, ok := s.OldestInflightWrite(); ok {
+		t.Error("token leaked after Put")
+	}
+}

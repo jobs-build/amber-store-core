@@ -18,6 +18,37 @@ import (
 // sealed, or already removed).
 var ErrUnknownSegment = errors.New("packstore: no such segment")
 
+// writeToken marks one in-flight exported write call for the GC horizon.
+type writeToken struct{ _ byte }
+
+func (s *Store) beginWrite() *writeToken {
+	t := new(writeToken)
+	s.writesMu.Lock()
+	s.writes[t] = time.Now()
+	s.writesMu.Unlock()
+	return t
+}
+
+func (s *Store) endWrite(t *writeToken) {
+	s.writesMu.Lock()
+	delete(s.writes, t)
+	s.writesMu.Unlock()
+}
+
+// OldestInflightWrite returns the start time of the oldest Put, WriteBatch
+// or WriteParallel still in progress. The GC horizon never passes it.
+func (s *Store) OldestInflightWrite() (time.Time, bool) {
+	s.writesMu.Lock()
+	defer s.writesMu.Unlock()
+	var min time.Time
+	for _, t := range s.writes {
+		if min.IsZero() || t.Before(min) {
+			min = t
+		}
+	}
+	return min, !min.IsZero()
+}
+
 // SegmentInfo describes one sealed segment.
 type SegmentInfo struct {
 	ID     uint64
