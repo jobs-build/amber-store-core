@@ -231,3 +231,74 @@ func TestThrottle(t *testing.T) {
 		t.Error("unlimited throttle slept")
 	}
 }
+
+// TestThrottleOwed exercises throttleOwed directly, across the boundary
+// where the old time.Duration(bytes)*time.Second formula overflowed int64
+// (bytes > ~8.6 GiB): divide-before-multiply must stay exact and never go
+// negative.
+func TestThrottleOwed(t *testing.T) {
+	const rate = int64(1 << 20) // 1 MiB/s
+	cases := []struct {
+		name string
+		n    int64
+		want time.Duration
+	}{
+		{"1MiB_exactly_1s", 1 << 20, time.Second},
+		{"512KiB_exactly_500ms", 512 << 10, 500 * time.Millisecond},
+		{"8GiB_below_old_boundary", 8 << 30, 8192 * time.Second},
+		{"10GiB_above_old_boundary", 10 << 30, 10240 * time.Second},
+		{"100GiB_no_overflow", 100 << 30, 102400 * time.Second},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got := throttleOwed(c.n, rate)
+			if got != c.want {
+				t.Errorf("throttleOwed(%d, %d) = %v, want %v", c.n, rate, got, c.want)
+			}
+			if got < 0 {
+				t.Errorf("throttleOwed(%d, %d) = %v, negative", c.n, rate, got)
+			}
+		})
+	}
+	// Monotonic across the old int64 overflow boundary (~8.6 GiB): the
+	// pre-fix formula wrapped negative here, which would have made pace
+	// stop throttling entirely partway through a large copy.
+	if got8, got10 := throttleOwed(8<<30, rate), throttleOwed(10<<30, rate); got10 <= got8 {
+		t.Errorf("throttleOwed not monotonic across the old overflow boundary: owed(8GiB)=%v, owed(10GiB)=%v", got8, got10)
+	}
+}
+
+// TestDeletePackReTestsCurrentUnion exercises deletePack's delta-copy
+// branch: reap() runs against a snapshot union that has nothing live, so it
+// copies nothing; a reference then arrives naming the victim's objects
+// before deletePack's exclusive re-test. deletePack must catch that under
+// the removal lock, or the objects are lost when the pack is removed.
+func TestDeletePackReTestsCurrentUnion(t *testing.T) {
+	ts := newTestStore(t, 4<<10)
+	root, keys := storeTree(t, ts.objects, "rt", 20)
+	c := ts.openCollector(t, Options{Grace: time.Hour})
+	backdatePacks(t, ts)
+	segs, err := ts.objects.Segments()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(segs) == 0 {
+		t.Fatal("no sealed segments")
+	}
+	victim := segs[0]
+	// Reap against the snapshot union, which is empty: nothing is copied.
+	if _, _, err := c.reap(context.Background(), c.union.Load(), victim.ID, newThrottle(0)); err != nil {
+		t.Fatal(err)
+	}
+	// A reference arrives between reap and delete — the exact window the
+	// exclusive re-test exists for.
+	putTestRef(t, c, ts.refs, "late", root)
+	if _, err := c.deletePack(victim.ID); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range keys {
+		if _, err := ts.objects.Get(k); err != nil {
+			t.Fatalf("object %s lost — deletePack did not re-test against the current union: %v", k, err)
+		}
+	}
+}

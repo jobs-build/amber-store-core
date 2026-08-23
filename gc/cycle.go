@@ -153,7 +153,7 @@ func (c *Collector) cycle(ctx context.Context, garbage float64) (stats CycleStat
 	remaining := slices.DeleteFunc(eligible, func(id uint64) bool { return reaped[id] })
 	c.mu.Lock()
 	c.haveLast = true
-	c.lastGen = c.union.Load().gen
+	c.lastGen = u.gen // the snapshot this cycle scored against, not the live union
 	c.lastEligible = remaining
 	c.lastThreshold = threshold
 	c.mu.Unlock()
@@ -163,7 +163,11 @@ func (c *Collector) cycle(ctx context.Context, garbage float64) (stats CycleStat
 // ensureClosures walks every named root that has no valid closure — at
 // first start on an existing store, before any cycle runs. A root that
 // cannot be walked (its reference already dangles: pre-collector damage)
-// aborts the cycle with the error naming it.
+// aborts the cycle with the error naming it. The walk holds the same
+// walking[root] reservation PrepareRef does, so a concurrent ReleaseRef
+// dropping the root's last name mid-walk cannot leave a stale closure file
+// on disk (a later PrepareRef reading it would skip its own walk and admit
+// a reference to objects a cycle may since have reaped).
 func (c *Collector) ensureClosures(ctx context.Context) error {
 	c.mu.Lock()
 	roots := slices.Collect(maps.Keys(c.pending))
@@ -172,12 +176,33 @@ func (c *Collector) ensureClosures(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		tails, err := c.ensureClosure(root)
-		if err != nil {
-			return err
-		}
 		c.mu.Lock()
-		if c.pending[root] { // not resolved by a concurrent PrepareRef
+		if !c.pending[root] { // resolved or released while we walked others
+			c.mu.Unlock()
+			continue
+		}
+		c.walking[root]++
+		c.mu.Unlock()
+
+		tails, err := c.ensureClosure(root)
+
+		c.mu.Lock()
+		c.walking[root]--
+		if c.walking[root] == 0 {
+			delete(c.walking, root)
+		}
+		switch {
+		case err != nil:
+			c.mu.Unlock()
+			return err
+		case c.roots[root] == 0:
+			// Released while we walked: the closure must not outlive the
+			// last name — a stale file would let a later PUT skip its walk.
+			if c.walking[root] == 0 {
+				c.d.remove(root)
+			}
+			delete(c.pending, root)
+		case c.pending[root]:
 			c.union.Store(c.union.Load().merge(tails, int32(c.roots[root])))
 			delete(c.pending, root)
 		}
@@ -352,10 +377,16 @@ func (t *throttle) pace(n int) {
 		return
 	}
 	t.bytes += int64(n)
-	ahead := time.Duration(t.bytes)*time.Second/time.Duration(t.rate) - time.Since(t.start)
+	ahead := throttleOwed(t.bytes, t.rate) - time.Since(t.start)
 	if ahead > 0 {
 		time.Sleep(ahead)
 	}
+}
+
+// throttleOwed is the total time a copy of n bytes at rate bytes/s should
+// have taken. Divide-before-multiply: n*1e9 overflows int64 past ~8.6 GiB.
+func throttleOwed(n, rate int64) time.Duration {
+	return time.Duration(n/rate)*time.Second + time.Duration((n%rate)*int64(time.Second)/rate)
 }
 
 // freeBelow reports whether the filesystem holding path has less than min
