@@ -14,11 +14,6 @@ import (
 	"github.com/jobs-build/amber-store-core/refstore"
 )
 
-// Lease is a forward reference to Task 11's upload-lease type: only the
-// leases map's key type is needed here. gc/lease.go replaces this stub with
-// the real type (c, root, start, last) and its methods.
-type Lease struct{}
-
 // Collector implements the cycle and the reference hooks over an open
 // packstore and refstore pair. Single-owner, like the stores it sits next
 // to; close it before them.
