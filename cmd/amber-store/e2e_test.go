@@ -180,6 +180,49 @@ func TestE2E_MissingStoreFlag(t *testing.T) {
 	}
 }
 
+func TestE2E_RefSetChecksCompleteness(t *testing.T) {
+	store := t.TempDir()
+	// A syntactically valid key that names nothing in the store.
+	bogus := strings.Repeat("00", 32)
+	if _, err := runApp(t, "--store", store, "ref", "set", "v1", bogus); err == nil {
+		t.Error("ref set to an absent key succeeded")
+	}
+}
+
+func TestE2E_RefLifecycleMaintainsClosures(t *testing.T) {
+	src := t.TempDir()
+	writeFixture(t, src)
+	store := t.TempDir()
+	out, err := runApp(t, "--store", store, "ingest", "--no-progress", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := strings.TrimSpace(out)
+	if _, err := runApp(t, "--store", store, "ref", "set", "v1", root); err != nil {
+		t.Fatalf("ref set: %v", err)
+	}
+	closure := filepath.Join(store, "closures", root+".tails")
+	if _, err := os.Stat(closure); err != nil {
+		t.Errorf("no closure after ref set: %v", err)
+	}
+	// A second name shares the closure; removing one keeps it.
+	if _, err := runApp(t, "--store", store, "ref", "set", "v2", root); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runApp(t, "--store", store, "ref", "rm", "v1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(closure); err != nil {
+		t.Errorf("closure gone while v2 lives: %v", err)
+	}
+	if _, err := runApp(t, "--store", store, "ref", "rm", "v2"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(closure); !os.IsNotExist(err) {
+		t.Error("closure survives the last rm")
+	}
+}
+
 func TestE2E_GC(t *testing.T) {
 	src := t.TempDir()
 	writeFixture(t, src)
