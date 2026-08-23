@@ -37,6 +37,7 @@ type Collector struct {
 	union   atomic.Pointer[union]
 	roots   map[key.Key]int  // root -> number of reference names
 	pending map[key.Key]bool // named roots with no valid closure yet; walked before the first cycle
+	walking map[key.Key]int  // in-flight PrepareRef walks; the closure file survives while nonzero
 	leases  map[*Lease]bool
 	// last *CycleStats lives here too — Task 12 adds it with the CycleStats type.
 	lastErr error
@@ -118,6 +119,7 @@ func Open(dir string, objects *packstore.Store, refs *refstore.Store, opts Optio
 		opts:    opts,
 		roots:   roots,
 		pending: pending,
+		walking: make(map[key.Key]int),
 		leases:  make(map[*Lease]bool),
 	}
 	c.union.Store(buildUnion(pairs))
@@ -182,12 +184,29 @@ func (c *Collector) ensureClosure(root key.Key) ([]uint64, error) {
 // the same root.
 func (c *Collector) PrepareRef(root key.Key) (commit, abort func(), err error) {
 	c.removal.RLock()
+	// Reserve the walk: while walking[root] is nonzero a concurrent
+	// ReleaseRef of the last name keeps the closure file on disk, so the
+	// read below cannot race a removal.
+	c.mu.Lock()
+	c.walking[root]++
+	c.mu.Unlock()
+
 	tails, err := c.ensureClosure(root)
+
+	c.mu.Lock()
+	c.walking[root]--
+	if c.walking[root] == 0 {
+		delete(c.walking, root)
+	}
 	if err != nil {
+		if c.roots[root] == 0 && c.walking[root] == 0 {
+			delete(c.pending, root)
+			c.d.remove(root) // best-effort; an unreadable leftover is an orphan
+		}
+		c.mu.Unlock()
 		c.removal.RUnlock()
 		return nil, nil, err
 	}
-	c.mu.Lock()
 	delta := int32(1)
 	if c.pending[root] {
 		// The open-time union never saw this root's closure; fold the
@@ -230,12 +249,18 @@ func (c *Collector) releaseLocked(root key.Key) error {
 	if !c.pending[root] {
 		if tails, ok := c.d.read(root); ok {
 			c.union.Store(c.union.Load().merge(tails, -1))
+		} else {
+			// Bookkeeping hole: the union keeps this name's contribution
+			// until a restart rebuilds it. Never silent.
+			c.lastErr = fmt.Errorf("gc: closure for root %s unreadable at release; union over-counts until reopen", root)
 		}
 	}
 	if c.roots[root] == 0 {
 		delete(c.roots, root)
 		delete(c.pending, root)
-		return c.d.remove(root)
+		if c.walking[root] == 0 {
+			return c.d.remove(root)
+		}
 	}
 	return nil
 }

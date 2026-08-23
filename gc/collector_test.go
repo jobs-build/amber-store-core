@@ -6,6 +6,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -301,5 +302,67 @@ func TestOpenPendingResolvedByPrepareRef(t *testing.T) {
 	}
 	if !c2.union.Load().contains(Tail(root)) {
 		t.Error("root died while names a and b still point at it")
+	}
+}
+
+func TestOpenWeighsSharedRoots(t *testing.T) {
+	ts := newTestStore(t, 1<<20)
+	root, keys := storeTree(t, ts.objects, "wr", 3)
+	c := ts.openCollector(t, Options{})
+	putTestRef(t, c, ts.refs, "a", root)
+	putTestRef(t, c, ts.refs, "b", root)
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+	c2 := ts.openCollector(t, Options{})
+	// The rebuilt union weighted the closure by both names: one release
+	// must not zero it out.
+	if err := ts.refs.Delete("a"); err != nil {
+		t.Fatal(err)
+	}
+	if err := c2.ReleaseRef(root); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range keys {
+		if !c2.union.Load().contains(Tail(k)) {
+			t.Fatalf("tail of %s died while name b still points at the root", k)
+		}
+	}
+}
+
+func TestConcurrentPrepareAndRelease(t *testing.T) {
+	ts := newTestStore(t, 1<<20)
+	root, _ := storeTree(t, ts.objects, "cc", 4)
+	c := ts.openCollector(t, Options{})
+	putTestRef(t, c, ts.refs, "keep", root) // roots stays >= 0 throughout
+	for i := 0; i < 100; i++ {
+		var wg sync.WaitGroup
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			commit, _, err := c.PrepareRef(root)
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			commit()
+		}()
+		go func() {
+			defer wg.Done()
+			if err := c.ReleaseRef(root); err != nil {
+				t.Error(err)
+			}
+		}()
+		wg.Wait()
+	}
+	// Net zero: exactly the original name remains.
+	if err := c.ReleaseRef(root); err != nil {
+		t.Fatal(err)
+	}
+	if n := c.union.Load().size(); n != 0 {
+		t.Fatalf("union holds %d tails after the last release — a merge-out was lost", n)
+	}
+	if _, ok := c.d.read(root); ok {
+		t.Error("closure file survives the last release")
 	}
 }
