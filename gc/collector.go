@@ -34,7 +34,7 @@ type Collector struct {
 	pending map[key.Key]bool // named roots with no valid closure yet; walked before the first cycle
 	walking map[key.Key]int  // in-flight PrepareRef walks; the closure file survives while nonzero
 	leases  map[*Lease]bool
-	// last *CycleStats lives here too — Task 12 adds it with the CycleStats type.
+	last    *CycleStats
 	lastErr error
 	// Cycle-skip bookkeeping: a cycle is skipped when the union, the
 	// eligible set and the line all match the previous completed cycle.
@@ -274,10 +274,7 @@ func (c *Collector) loop(ctx context.Context) {
 	}
 }
 
-// runTick is the background cycle entry; Task 12 implements it (Run).
+// runTick is the background cycle entry.
 func (c *Collector) runTick(ctx context.Context) {
-	// No cycle machinery yet: the interval loop exists so Open/Close
-	// lifecycles are final from the start. Task 12 replaces this body
-	// with a Run call.
-	_ = ctx
+	c.Run(ctx, -1) // skip logic inside; errors land in Status.LastError
 }
