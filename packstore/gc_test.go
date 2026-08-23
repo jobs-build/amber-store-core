@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -398,4 +399,51 @@ func TestRemoveDuringReads(t *testing.T) {
 		t.Fatal(err)
 	}
 	<-done
+}
+
+// TestRemoveWaitsForScrubs pins the victim segment via a slow ScanIndex walk
+// and asserts Remove blocks until that walk finishes before it returns
+// (i.e. before it would munmap). Without waitScrubs ordered strictly before
+// seg.close(), this test would not fail deterministically on its own — it
+// was verified by temporarily moving the wait after seg.close() and
+// observing the failure (see task-4-report.md).
+func TestRemoveWaitsForScrubs(t *testing.T) {
+	s := gcStore(t, testObjects(t, 24))
+	segs, err := s.Segments()
+	if err != nil {
+		t.Fatal(err)
+	}
+	victim := segs[0]
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var scanDone atomic.Bool
+	go func() {
+		err := s.ScanIndex(victim.ID, func(key.Key, uint64, uint32) {
+			select {
+			case entered <- struct{}{}: // first entry only
+			default:
+			}
+			<-release
+		})
+		scanDone.Store(true)
+		if err != nil {
+			t.Error(err)
+		}
+	}()
+	<-entered // the scan holds a pin on the victim's mmap
+	removed := make(chan error, 1)
+	go func() { removed <- s.Remove(victim.ID) }()
+	// Remove must not complete while the pin is held.
+	select {
+	case err := <-removed:
+		t.Fatalf("Remove returned (%v) while a scrub held the mmap", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	if err := <-removed; err != nil {
+		t.Fatal(err)
+	}
+	if !scanDone.Load() {
+		t.Error("Remove returned before the pinned scan finished")
+	}
 }

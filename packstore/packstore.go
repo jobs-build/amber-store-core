@@ -81,8 +81,50 @@ type Store struct {
 	active   *activeSegment   // nil until the first write of a session
 	nextID   uint64
 	closed   bool
-	failed   error          // sticky write-path failure; written under appendMu+mu, read under either
-	scrubs   sync.WaitGroup // in-flight Verify walks; Close waits before munmap
+	failed   error // sticky write-path failure; written under appendMu+mu, read under either
+
+	// scrubMu/scrubN/scrubC track in-flight lock-free mmap walks (Verify,
+	// ScanIndex, Record): Close/Wipe/Remove wait for scrubN to reach 0 before
+	// munmap. A plain sync.WaitGroup does not work here: Remove and Wipe
+	// release mu before waiting, so a new scrub can register (Add) while the
+	// wait is in progress, and WaitGroup treats a concurrent Add-during-Wait
+	// as misuse and panics. The cond var tolerates that: a late scrub cannot
+	// reach a segment already detached from the probe list, so the waiter
+	// just keeps waiting until scrubN drops back to 0. See beginScrub,
+	// endScrub, waitScrubs.
+	scrubMu sync.Mutex
+	scrubN  int
+	scrubC  *sync.Cond
+}
+
+// beginScrub registers a lock-free mmap walk. Call while holding mu.RLock
+// after the closed check, so registration is ordered before Close, Wipe and
+// Remove detach segments.
+func (s *Store) beginScrub() {
+	s.scrubMu.Lock()
+	s.scrubN++
+	s.scrubMu.Unlock()
+}
+
+// endScrub deregisters a walk started with beginScrub.
+func (s *Store) endScrub() {
+	s.scrubMu.Lock()
+	s.scrubN--
+	if s.scrubN == 0 {
+		s.scrubC.Broadcast()
+	}
+	s.scrubMu.Unlock()
+}
+
+// waitScrubs blocks until no scrub is in flight. Unlike WaitGroup.Wait it
+// tolerates concurrent registrations: a late scrub cannot reach a segment
+// already detached from the probe list, and the waiter just keeps waiting.
+func (s *Store) waitScrubs() {
+	s.scrubMu.Lock()
+	for s.scrubN > 0 {
+		s.scrubC.Wait()
+	}
+	s.scrubMu.Unlock()
 }
 
 // Open opens (creating if necessary) a store rooted at dir. Only one Store
@@ -106,6 +148,7 @@ func Open(dir string, opts ...Option) (*Store, error) {
 		return nil, fmt.Errorf("packstore: %s is already open: %w", dir, err)
 	}
 	s := &Store{dir: dir, dirF: dirF, cfg: cfg, nextID: 1}
+	s.scrubC = sync.NewCond(&s.scrubMu)
 	if err := s.load(); err != nil {
 		s.releaseDir()
 		return nil, err
@@ -655,9 +698,11 @@ func (s *Store) Wipe() error {
 	s.failed = nil
 	// From here readers see an empty store; a Verify that started after this
 	// unlock walks an empty snapshot. Pre-existing scrubs still hold the old
-	// mmaps, so wait before unmapping (see Close).
+	// mmaps, so wait before unmapping (see Close). waitScrubs tolerates a
+	// scrub registering after this unlock (unlike WaitGroup.Wait): it can
+	// only ever reach the empty snapshot above, never the detached segments.
 	s.mu.Unlock()
-	s.scrubs.Wait()
+	s.waitScrubs()
 
 	var firstErr error
 	if active != nil {
@@ -710,7 +755,7 @@ func (s *Store) Close() error {
 	// scrubs cannot start (closed is set; Verify checks it under mu.RLock).
 	// Callers wanting a faster Close cancel Verify's context first.
 	s.mu.Unlock()
-	s.scrubs.Wait()
+	s.waitScrubs()
 
 	for _, seg := range s.sealed {
 		if err := seg.close(); err != nil && firstErr == nil {

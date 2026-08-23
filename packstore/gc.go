@@ -51,8 +51,8 @@ func (s *Store) Segments() ([]SegmentInfo, error) {
 }
 
 // pinSegment finds sealed segment id and registers a scrub so the mmap
-// outlives the caller's walk (Remove waits on scrubs before munmap). The
-// caller must s.scrubs.Done() when finished with the segment.
+// outlives the caller's walk (Remove waits for scrubs before munmap). The
+// caller must s.endScrub() when finished with the segment.
 func (s *Store) pinSegment(id uint64) (*sealedSegment, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -61,7 +61,7 @@ func (s *Store) pinSegment(id uint64) (*sealedSegment, error) {
 	}
 	for _, g := range s.sealed {
 		if g.id == id {
-			s.scrubs.Add(1)
+			s.beginScrub()
 			return g, nil
 		}
 	}
@@ -76,7 +76,7 @@ func (s *Store) ScanIndex(id uint64, fn func(k key.Key, off uint64, slen uint32)
 	if err != nil {
 		return err
 	}
-	defer s.scrubs.Done()
+	defer s.endScrub()
 	fv := seg.fv
 	for i := uint64(0); i < fv.keyCount; i++ {
 		e := fv.entries[i*indexEntrySize : (i+1)*indexEntrySize]
@@ -94,7 +94,7 @@ func (s *Store) Record(id, off uint64) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer s.scrubs.Done()
+	defer s.endScrub()
 	body := uint64(seg.fv.bodyLen)
 	// Overflow-safe: off may come from a crafted index; off+RecHeaderSize
 	// could wrap. Same shape as the sealed-segment readers in footer.go.
@@ -184,8 +184,8 @@ func (s *Store) Remove(id uint64) error {
 		return ErrUnknownSegment
 	}
 	seg := s.sealed[idx]
-	// Fresh slice: scrubs hold snapshots of the old backing array; an
-	// in-place splice would shift entries under them.
+	// Fresh slice: never mutate an array a concurrent reader may still hold;
+	// the old array stays valid for anyone who grabbed it.
 	ns := make([]*sealedSegment, 0, len(s.sealed)-1)
 	ns = append(ns, s.sealed[:idx]...)
 	ns = append(ns, s.sealed[idx+1:]...)
@@ -193,9 +193,11 @@ func (s *Store) Remove(id uint64) error {
 	s.mu.Unlock()
 	s.appendMu.Unlock()
 
-	// Pre-existing scrubs may still walk the old snapshot's mmaps; munmap
-	// under them is an uncatchable SIGSEGV.
-	s.scrubs.Wait()
+	// Pre-existing scrubs may still be walking seg's mmap; munmap under one
+	// is an uncatchable SIGSEGV. waitScrubs tolerates a scrub registering
+	// after the unlock above: it can only reach segments still in s.sealed,
+	// never seg (already detached), so the wait still terminates correctly.
+	s.waitScrubs()
 	var firstErr error
 	if err := seg.close(); err != nil {
 		firstErr = err
