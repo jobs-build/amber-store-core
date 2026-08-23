@@ -3,6 +3,8 @@ package packstore
 import (
 	"bytes"
 	"errors"
+	"fmt"
+	"io/fs"
 	"math"
 	"os"
 	"path/filepath"
@@ -272,4 +274,128 @@ func TestAppendRecordValidates(t *testing.T) {
 	if !bytes.Equal(got, want) {
 		t.Error("payload mismatch after AppendRecord")
 	}
+}
+
+func TestRemove(t *testing.T) {
+	objs := testObjects(t, 24)
+	s := gcStore(t, objs)
+	segs, err := s.Segments()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(segs) < 2 {
+		t.Fatal("need at least two segments")
+	}
+	victim := segs[0]
+	// Copy every record out first, like a reap does.
+	type entry struct {
+		k   key.Key
+		off uint64
+	}
+	var live []entry
+	if err := s.ScanIndex(victim.ID, func(k key.Key, off uint64, _ uint32) {
+		live = append(live, entry{k, off})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range live {
+		raw, err := s.Record(victim.ID, e.off)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.AppendRecord(e.k, raw); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(s.dir, fmt.Sprintf("%016x.seg", victim.ID))
+	if err := s.Remove(victim.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !errors.Is(err, fs.ErrNotExist) {
+		t.Errorf("segment file still exists: %v", err)
+	}
+	// Every original object still reads back.
+	for _, o := range objs {
+		got, err := s.Get(o.Key)
+		if err != nil {
+			t.Fatalf("Get(%s) after Remove: %v", o.Key, err)
+		}
+		if !bytes.Equal(got, o.Data) {
+			t.Errorf("payload mismatch for %s", o.Key)
+		}
+	}
+	// The victim is gone from Segments and from the GC surface.
+	segs2, err := s.Segments()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, g := range segs2 {
+		if g.ID == victim.ID {
+			t.Error("removed segment still listed")
+		}
+	}
+	if err := s.ScanIndex(victim.ID, func(key.Key, uint64, uint32) {}); !errors.Is(err, ErrUnknownSegment) {
+		t.Errorf("ScanIndex after Remove: %v", err)
+	}
+	if err := s.Remove(victim.ID); !errors.Is(err, ErrUnknownSegment) {
+		t.Errorf("double Remove: %v", err)
+	}
+	// Survives reopen: no half-state on disk.
+	dir := s.dir
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	s2 := openStore(t, dir)
+	for _, o := range objs {
+		if _, err := s2.Get(o.Key); err != nil {
+			t.Fatalf("Get(%s) after reopen: %v", o.Key, err)
+		}
+	}
+}
+
+func TestRemoveDuringReads(t *testing.T) {
+	objs := testObjects(t, 24)
+	s := gcStore(t, objs)
+	segs, err := s.Segments()
+	if err != nil {
+		t.Fatal(err)
+	}
+	victim := segs[0]
+	var live []key.Key
+	var offs []uint64
+	if err := s.ScanIndex(victim.ID, func(k key.Key, off uint64, _ uint32) {
+		live = append(live, k)
+		offs = append(offs, off)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	for i, k := range live {
+		raw, err := s.Record(victim.ID, offs[i])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := s.AppendRecord(k, raw); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Hammer reads of every object while the victim disappears.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 50; i++ {
+			for _, o := range objs {
+				if _, err := s.Get(o.Key); err != nil {
+					t.Errorf("Get during Remove: %v", err)
+					return
+				}
+			}
+		}
+	}()
+	if err := s.Remove(victim.ID); err != nil {
+		t.Fatal(err)
+	}
+	<-done
 }

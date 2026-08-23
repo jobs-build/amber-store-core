@@ -158,3 +158,55 @@ func (s *Store) AppendRecord(k key.Key, raw []byte) error {
 func (s *Store) Sync() error {
 	return s.syncActive()
 }
+
+// Remove drops sealed segment id: out of the probe list under the write
+// lock (draining in-flight reads, like a seal), munmap after in-flight
+// scrubs (as Close does), unlink, fsync the directory. The caller ensures
+// every live record was copied out first.
+func (s *Store) Remove(id uint64) error {
+	s.appendMu.Lock()
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		s.appendMu.Unlock()
+		return ErrClosed
+	}
+	idx := -1
+	for i, g := range s.sealed {
+		if g.id == id {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		s.mu.Unlock()
+		s.appendMu.Unlock()
+		return ErrUnknownSegment
+	}
+	seg := s.sealed[idx]
+	// Fresh slice: scrubs hold snapshots of the old backing array; an
+	// in-place splice would shift entries under them.
+	ns := make([]*sealedSegment, 0, len(s.sealed)-1)
+	ns = append(ns, s.sealed[:idx]...)
+	ns = append(ns, s.sealed[idx+1:]...)
+	s.sealed = ns
+	s.mu.Unlock()
+	s.appendMu.Unlock()
+
+	// Pre-existing scrubs may still walk the old snapshot's mmaps; munmap
+	// under them is an uncatchable SIGSEGV.
+	s.scrubs.Wait()
+	var firstErr error
+	if err := seg.close(); err != nil {
+		firstErr = err
+	}
+	if err := os.Remove(seg.path); err != nil && firstErr == nil {
+		firstErr = err
+	}
+	if s.cfg.sync {
+		if err := s.dirF.Sync(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+	return firstErr
+}
