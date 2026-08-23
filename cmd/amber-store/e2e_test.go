@@ -223,6 +223,35 @@ func TestE2E_RefLifecycleMaintainsClosures(t *testing.T) {
 	}
 }
 
+func TestE2E_RefSameRootRePut(t *testing.T) {
+	src := t.TempDir()
+	writeFixture(t, src)
+	store := t.TempDir()
+	out, err := runApp(t, "--store", store, "ingest", "--no-progress", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := strings.TrimSpace(out)
+	if _, err := runApp(t, "--store", store, "ref", "set", "v1", root); err != nil {
+		t.Fatalf("first set: %v", err)
+	}
+	// Same name, same root: the re-put must net to zero in the name count.
+	if _, err := runApp(t, "--store", store, "ref", "set", "v1", root); err != nil {
+		t.Fatalf("same-root re-put: %v", err)
+	}
+	closure := filepath.Join(store, "closures", root+".tails")
+	if _, err := os.Stat(closure); err != nil {
+		t.Fatalf("closure missing after re-put: %v", err)
+	}
+	if _, err := runApp(t, "--store", store, "ref", "rm", "v1"); err != nil {
+		t.Fatal(err)
+	}
+	// A leaked count from the re-put would leave the closure alive here.
+	if _, err := os.Stat(closure); !os.IsNotExist(err) {
+		t.Error("closure survives the only rm: the same-root re-put leaked a name count")
+	}
+}
+
 func TestE2E_GC(t *testing.T) {
 	src := t.TempDir()
 	writeFixture(t, src)
@@ -257,10 +286,9 @@ func TestE2E_GC(t *testing.T) {
 		t.Errorf("gc status output %q missing totals", out)
 	}
 
-	// A forced run with a tiny grace reaps the dead majority — and, before
-	// anything else, walks the closure of every named root (gc why needs
-	// them; until Task 16 lands, ingest --ref writes references without
-	// closures).
+	// A forced run with a tiny grace reaps the dead majority. (References
+	// written by ingest --ref carry closures since the collector wiring
+	// landed; the cycle would also walk any that were missing.)
 	time.Sleep(50 * time.Millisecond) // put seals safely behind a 1ms grace
 	out, err = runApp(t, append(seg, "gc", "run", "--grace", "1ms", "--garbage", "0")...)
 	if err != nil {
