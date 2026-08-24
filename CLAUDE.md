@@ -98,3 +98,31 @@ filesystem-dependent. Ref put and delete are 3–4× faster (Pebble writes
 with `pebble.Sync`, so the same fsync story). No memory-pressure stalls:
 ingest decayed gently
 1095 → 965 MiB/s over the run with per-ref maxima ≤ 139 ms.
+
+### Results, 2026-08-25, Linux arm64 (branch `simple-gc`, same commit)
+
+ASUS Ascent GX10 (NVIDIA GB10: 10× Cortex-X925 + 10× Cortex-A725,
+20 cores), 119 GiB RAM, NVMe, ext4 (no reflinks, full 66 GiB dataset on
+disk); same defaults. Seeding held: same dataset and 200 packs after
+ingest; the policy pass reaped 64 packs here (i7 reaped 63, Mac 63–64),
+so the mid trajectory differs slightly: 49.90 → 39.62 → 32.52 GiB.
+
+| step | GX10 (GB10 arm64) | Linux i7-1280P |
+| --- | --- | --- |
+| ingest 1000 refs | 114.7 s, 591 MiB/s logical, 445 MiB/s new bytes | 66.4 s, 1021 / 769 MiB/s |
+| ref put (closure walk) | 14.4 → 17.2 ms/ref over the run | 3.1 → 6.6 ms/ref |
+| delete 700 refs | 7.3 s (10.4 ms/ref) | 2.5 s (3.6 ms/ref) |
+| `gc run` (0.5 line): 64 reaped, 5.7 GiB copied, 16.0 GiB freed | **11.6 s** | 6.0 s (63 reaped) |
+| `gc run --garbage 0`: 106 reaped, 19.4 GiB copied, 26.5 GiB freed | **40.4 s** | 20.2 s (107 reaped) |
+| copier throughput | ~490–510 MiB/s | ~990–1000 MiB/s |
+| integrity | 300/300 complete, 10 restores identical | same |
+
+Roughly half the i7's throughput across the board, with the same shape:
+the copier again sits just above ingest's new-byte rate (~500 vs
+445 MiB/s), consistent with both serializing on the packstore append
+lock + fsync — the ceiling is per-core/fsync speed, which the GB10's
+efficiency-heavy core mix and NVMe path deliver less of than the
+i7-1280P despite 20 cores. Ref put and delete land near the Mac's
+numbers, not the i7's, so the Pebble `pebble.Sync` write cost here is
+APFS-like. Ingest decayed gently 615 → 562 MiB/s with per-ref maxima
+≤ 249 ms; no stalls (dataset + packs fit the 119 GiB page cache).
