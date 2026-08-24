@@ -147,6 +147,10 @@ func runRefRm(c *cli.Context) error {
 // record is stored, and an overwritten root is released. This is the
 // optimistic reference PUT: on a 404 the caller re-sends the missing
 // objects and retries.
+//
+// Calls for one name must be serialized by the caller (the one-shot CLI
+// is); the read-old → prepare → put → release sequence is not atomic
+// against a concurrent writer of the same name.
 func putRef(coll *gc.Collector, refs *refstore.Store, name string, root key.Key, raw []byte) error {
 	var old *key.Key
 	if prev, err := refs.Get(name); err == nil {

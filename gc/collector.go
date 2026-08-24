@@ -224,7 +224,11 @@ func (c *Collector) PrepareRef(root key.Key) (commit, abort func(), err error) {
 	if err != nil {
 		if c.roots[root] == 0 && c.walking[root] == 0 {
 			delete(c.pending, root)
-			c.d.remove(root) // best-effort; an unreadable leftover is an orphan
+			if rerr := c.d.remove(root); rerr != nil {
+				// A stale closure that survives here lets a later PUT skip
+				// its walk; the next Open sweeps it, but never be silent.
+				c.lastErr = fmt.Errorf("gc: removing closure for released root %s: %w", root, rerr)
+			}
 		}
 		c.mu.Unlock()
 		c.removal.RUnlock()

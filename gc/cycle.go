@@ -9,6 +9,7 @@ import (
 	"cmp"
 	"context"
 	"errors"
+	"fmt"
 	"maps"
 	"slices"
 	"time"
@@ -198,8 +199,14 @@ func (c *Collector) ensureClosures(ctx context.Context) error {
 		case c.roots[root] == 0:
 			// Released while we walked: the closure must not outlive the
 			// last name — a stale file would let a later PUT skip its walk.
+			// A failed removal breaks that invariant, so no cycle may run
+			// past it.
 			if c.walking[root] == 0 {
-				c.d.remove(root)
+				if rerr := c.d.remove(root); rerr != nil {
+					delete(c.pending, root)
+					c.mu.Unlock()
+					return fmt.Errorf("gc: removing stale closure for root %s: %w", root, rerr)
+				}
 			}
 			delete(c.pending, root)
 		case c.pending[root]:

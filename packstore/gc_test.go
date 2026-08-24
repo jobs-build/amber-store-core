@@ -9,7 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"sync/atomic"
+	"sync"
 	"testing"
 	"time"
 
@@ -414,10 +414,15 @@ func TestRemoveWaitsForScrubs(t *testing.T) {
 		t.Fatal(err)
 	}
 	victim := segs[0]
-	entered := make(chan struct{})
+	// Buffered so the non-blocking send from inside ScanIndex's callback can
+	// never be missed, however the two goroutines interleave.
+	entered := make(chan struct{}, 1)
 	release := make(chan struct{})
-	var scanDone atomic.Bool
+	closeRelease := sync.OnceFunc(func() { close(release) })
+	defer closeRelease() // a t.Fatalf below must not leave the scan (and Close) hanging
+	scanFinished := make(chan struct{})
 	go func() {
+		defer close(scanFinished)
 		err := s.ScanIndex(victim.ID, func(key.Key, uint64, uint32) {
 			select {
 			case entered <- struct{}{}: // first entry only
@@ -425,7 +430,6 @@ func TestRemoveWaitsForScrubs(t *testing.T) {
 			}
 			<-release
 		})
-		scanDone.Store(true)
 		if err != nil {
 			t.Error(err)
 		}
@@ -439,13 +443,11 @@ func TestRemoveWaitsForScrubs(t *testing.T) {
 		t.Fatalf("Remove returned (%v) while a scrub held the mmap", err)
 	case <-time.After(100 * time.Millisecond):
 	}
-	close(release)
+	closeRelease()
 	if err := <-removed; err != nil {
 		t.Fatal(err)
 	}
-	if !scanDone.Load() {
-		t.Error("Remove returned before the pinned scan finished")
-	}
+	<-scanFinished // wait out the scan goroutine before the test returns
 }
 
 func TestOldestInflightWrite(t *testing.T) {

@@ -194,6 +194,12 @@ func (s *Store) Sync() error {
 // lock (draining in-flight reads, like a seal), munmap after in-flight
 // scrubs (as Close does), unlink, fsync the directory. The caller ensures
 // every live record was copied out first.
+//
+// waitScrubs is a global gate: it waits out every in-flight scrub, not just
+// this segment's pins; under sustained ScanIndex/Verify traffic that can
+// stall Remove (and a gc deletePack holding its removal lock). Per-segment
+// pinning is the known follow-up before a long-running embedder leans on
+// this.
 func (s *Store) Remove(id uint64) error {
 	s.appendMu.Lock()
 	s.mu.Lock()
