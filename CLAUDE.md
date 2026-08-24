@@ -72,3 +72,29 @@ per `ReleaseRef`. The first run's ingest tail (stalls up to 3 s on single
 refs from ref ~600 on) was macOS memory pressure — 67 GiB of fresh source
 plus 50 GiB of mmapped packs against 48 GiB of RAM — not the store; the
 rerun did not reproduce it.
+
+### Results, 2026-08-25, Linux (branch `simple-gc`, same commit as pipelined)
+
+i7-1280P laptop (14 cores / 20 threads), 62 GiB RAM, NVMe, ext4 on
+`/tmp` (no reflinks, so gen writes the shared files as full copies —
+identical bytes, dataset just costs the full 66 GiB on disk); same
+defaults (256 MiB segments, fsync on). Seeding held: same 200 packs after
+ingest and the same on-disk trajectory 49.90 → 39.74 → 32.52 GiB.
+
+| step | Linux i7-1280P | Mac pipelined (f739c7d) |
+| --- | --- | --- |
+| ingest 1000 refs | 66.4 s, 1021 MiB/s logical, 769 MiB/s new bytes | 71.3 s, 950 / 716 MiB/s |
+| ref put (closure walk) | 3.1 → 6.6 ms/ref over the run | 15 → 18 ms/ref |
+| delete 700 refs | 2.5 s (3.6 ms/ref) | 10.9 s (15.5 ms/ref) |
+| `gc run` (0.5 line): 63 reaped, 5.6 GiB copied, 15.8 GiB freed | **6.0 s** | **8.6 s** |
+| `gc run --garbage 0`: 107 reaped, 19.5 GiB copied, 26.8 GiB freed | **20.2 s** | **33.0 s** |
+| copier throughput | ~990–1000 MiB/s | ~600–680 MiB/s |
+| integrity | 300/300 complete, 10 restores identical | same |
+
+Notably the copier runs *above* ingest's new-byte rate here (~1000 vs
+769 MiB/s) — on ext4 the fsync under the append lock is cheaper than on
+APFS, so the Mac conclusion "next lever is the fsync" is
+filesystem-dependent. Ref put and delete are 3–4× faster (Pebble writes
+with `pebble.Sync`, so the same fsync story). No memory-pressure stalls:
+ingest decayed gently
+1095 → 965 MiB/s over the run with per-ref maxima ≤ 139 ms.
