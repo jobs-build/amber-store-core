@@ -1,5 +1,10 @@
 # amber-store-core — project notes
 
+## Dev environment
+
+The Nix dev shell (`flake.nix`) provides `go`, `nodejs` (builds the embedded
+admin SPA via `go generate ./cmd/amber-store`), and `python3`.
+
 ## Benchmarks
 
 `cmd/amber-bench` is the ingest → delete → gc benchmark; its doc comment
