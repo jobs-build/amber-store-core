@@ -41,7 +41,7 @@ type Options struct {
 	MinFree  uint64        // free-space floor in bytes; 0 = 5 % of the filesystem
 	Rate     int64         // copier bandwidth cap in bytes/s; 0 = unlimited
 	Interval time.Duration // time between background cycles; 0 = none
-	Jobs     int           // walk and score parallelism; <= 0 = GOMAXPROCS
+	Jobs     int           // walk, score and copy parallelism; <= 0 = GOMAXPROCS
 	NoSync   bool          // skip fsyncs (mirrors packstore.WithSync(false); tests)
 }
 

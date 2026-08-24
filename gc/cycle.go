@@ -12,6 +12,8 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/errgroup"
@@ -284,45 +286,98 @@ func (c *Collector) liveIn(id uint64, u *union) ([]liveEntry, error) {
 }
 
 // copyLive re-appends the live records not already stored outside the
-// victim: read in file order, CRC-checked, appended raw. Batches share one
-// fsync; the throttle caps bytes/s.
+// victim, pipelined like packstore.WriteParallel: a distributor feeds the
+// entries in file order to Options.Jobs workers, each of which probes
+// HasOutside, reads and CRC-checks its record and appends it raw. Appends
+// serialize on the active segment; the probe, the read and the CRC overlap
+// across workers, and so does the fsync a worker issues after
+// copyBatchBytes of its own appends — one more fsync at the end covers
+// everything (the segment file is shared). The throttle caps the aggregate
+// bytes/s. A worker error cancels its siblings and is returned with the
+// counts so far; a cancelled ctx surfaces as its error.
 func (c *Collector) copyLive(ctx context.Context, id uint64, live []liveEntry, th *throttle) (int, int64, error) {
-	const batchBytes = 8 << 20
-	var records int
-	var copied, inBatch int64
-	for _, e := range live {
-		if err := ctx.Err(); err != nil {
-			return records, copied, err
-		}
-		outside, err := c.objects.HasOutside(id, e.k)
-		if err != nil {
-			return records, copied, err
-		}
-		if outside {
-			continue
-		}
-		raw, err := c.objects.Record(id, e.off)
-		if err != nil {
-			return records, copied, err
-		}
-		if err := c.objects.AppendRecord(e.k, raw); err != nil {
-			return records, copied, err
-		}
-		records++
-		copied += int64(len(raw))
-		inBatch += int64(len(raw))
-		th.pace(len(raw))
-		if inBatch >= batchBytes {
-			if err := c.objects.Sync(); err != nil {
-				return records, copied, err
+	workers := max(1, min(c.opts.Jobs, len(live)))
+	wctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	ch := make(chan liveEntry, workers*2)
+	var records, copied atomic.Int64
+	g := &errgroup.Group{}
+	// Distributor: file order in, so a victim is read sequentially even
+	// though workers finish out of order. On cancellation it returns nil:
+	// the cause — a worker's error or the caller's ctx — is reported below.
+	g.Go(func() error {
+		defer close(ch)
+		for _, e := range live {
+			select {
+			case ch <- e:
+			case <-wctx.Done():
+				return nil
 			}
-			inBatch = 0
+		}
+		return nil
+	})
+	for range workers {
+		g.Go(func() error {
+			err := c.copyWorker(wctx, id, ch, th, &records, &copied)
+			if err != nil {
+				cancel() // stop the distributor and sibling workers
+			}
+			return err
+		})
+	}
+	err := g.Wait()
+	if err == nil {
+		err = ctx.Err()
+	}
+	if err == nil && records.Load() > 0 {
+		err = c.objects.Sync()
+	}
+	return int(records.Load()), copied.Load(), err
+}
+
+// copyBatchBytes is the bytes a copy worker appends between fsyncs.
+const copyBatchBytes = 8 << 20
+
+// copyWorker consumes live entries until the channel closes or ctx is
+// cancelled (returning nil: the cause is the caller's to report), fsyncing
+// after every copyBatchBytes of its own appends. The final fsync is
+// copyLive's.
+func (c *Collector) copyWorker(ctx context.Context, id uint64, ch <-chan liveEntry, th *throttle, records, copied *atomic.Int64) error {
+	var inBatch int64
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case e, ok := <-ch:
+			if !ok {
+				return nil
+			}
+			outside, err := c.objects.HasOutside(id, e.k)
+			if err != nil {
+				return err
+			}
+			if outside {
+				continue
+			}
+			raw, err := c.objects.Record(id, e.off)
+			if err != nil {
+				return err
+			}
+			if err := c.objects.AppendRecord(e.k, raw); err != nil {
+				return err
+			}
+			records.Add(1)
+			copied.Add(int64(len(raw)))
+			inBatch += int64(len(raw))
+			th.pace(len(raw))
+			if inBatch >= copyBatchBytes {
+				if err := c.objects.Sync(); err != nil {
+					return err
+				}
+				inBatch = 0
+			}
 		}
 	}
-	if err := c.objects.Sync(); err != nil {
-		return records, copied, err
-	}
-	return records, copied, nil
 }
 
 // reap copies a victim's live records against the snapshot union; the
@@ -368,10 +423,13 @@ func (c *Collector) deletePack(id uint64) (copyStats, error) {
 	return copyStats{records, bytes}, nil
 }
 
-// throttle paces the copier to rate bytes/s; zero rate never sleeps.
+// throttle paces the copier to rate bytes/s; zero rate never sleeps. It is
+// shared by every copy worker, so it bounds the aggregate: each caller
+// sleeps until the total copied so far is owed by the clock.
 type throttle struct {
 	rate  int64
 	start time.Time
+	mu    sync.Mutex
 	bytes int64
 }
 
@@ -383,8 +441,10 @@ func (t *throttle) pace(n int) {
 	if t.rate <= 0 {
 		return
 	}
+	t.mu.Lock()
 	t.bytes += int64(n)
 	ahead := throttleOwed(t.bytes, t.rate) - time.Since(t.start)
+	t.mu.Unlock()
 	if ahead > 0 {
 		time.Sleep(ahead)
 	}

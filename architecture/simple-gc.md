@@ -98,7 +98,8 @@ score      per pack, in parallel: walk its footer index; entry live iff its
            tail is in the union; garbage = 1 − Σ (46 + slen) / body
 select     every eligible pack (sealed before the horizon) with
            garbage > --gc-garbage, most garbage first
-reap       per victim: live records, file order, raw → active segment
+reap       per victim: live records, file order, raw → active segment,
+           `Jobs` copy workers
 delete     removal lock (exclusive): re-test the victim's index against the
            current union, copy what is live and not yet elsewhere; drop the
            pack from the probe list; munmap, unlink, fsync dir
@@ -118,10 +119,14 @@ any level.
 **Reaping.** The victim is immutable and stays readable. Its index is walked
 once more to list live entries; their records are read in file order,
 CRC-checked, and re-appended raw (`AppendRecord`: no decode, no re-encode)
-unless the key already exists outside the victim (`HasOutside`). Batches with
-one fsync each, `--gc-rate`-throttled; the active segment rotates as usual.
-Survivors are a pack's long-lived part, so stable data clusters over cycles
-without generations.
+unless the key already exists outside the victim (`HasOutside`). The copy is
+pipelined like `WriteParallel`: a distributor hands the entries out in file
+order to `Jobs` workers, each doing the probe, the read and the CRC for its
+record and appending it — appends serialize on the active segment, the rest
+overlaps, and so does each worker's fsync after 8 MiB of its own appends;
+one more fsync at the end covers the victim. `--gc-rate` caps the aggregate;
+the active segment rotates as usual. Survivors are a pack's long-lived part,
+so stable data clusters over cycles without generations.
 
 **Deleting.** Reaping used the snapshot union; references written since may
 name more of the victim. Under the removal lock held exclusively the victim's

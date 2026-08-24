@@ -3,12 +3,58 @@ package gc
 import (
 	"context"
 	"errors"
+	"hash/crc32"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/jobs-build/amber-store-core/fstree"
+	"github.com/jobs-build/amber-store-core/key"
+	"github.com/jobs-build/amber-store-core/packstore"
 )
+
+// storeInterleavedTrees stores two FileNode trees of n incompressible
+// 256-byte blobs each, alternating one blob of "a" and one of "b", so every
+// pack holds records of both. Roots go last. Returns each tree's root and
+// keys.
+func storeInterleavedTrees(t *testing.T, st *packstore.Store, n int) (rootA key.Key, keysA []key.Key, rootB key.Key, keysB []key.Key) {
+	t.Helper()
+	blob := func(seed string, i int) key.Key {
+		rng := rand.New(rand.NewPCG(uint64(crc32.ChecksumIEEE([]byte(seed))), uint64(i)))
+		data := make([]byte, 256)
+		for j := range data {
+			data[j] = byte(rng.UintN(256))
+		}
+		o, err := fstree.EncodeBlob(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := st.Put(o.Key, o.Bytes); err != nil {
+			t.Fatal(err)
+		}
+		return o.Key
+	}
+	for i := 0; i < n; i++ {
+		keysA = append(keysA, blob("a", i))
+		keysB = append(keysB, blob("b", i))
+	}
+	root := func(children []key.Key) key.Key {
+		o, err := fstree.EncodeFileNode(children)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := st.Put(o.Key, o.Bytes); err != nil {
+			t.Fatal(err)
+		}
+		return o.Key
+	}
+	rootA, rootB = root(keysA), root(keysB)
+	return rootA, append(keysA, rootA), rootB, append(keysB, rootB)
+}
 
 // backdatePacks pushes every sealed .seg mtime two hours into the past so
 // grace does not protect them.
@@ -229,6 +275,115 @@ func TestThrottle(t *testing.T) {
 	unlimited.pace(1 << 30)
 	if time.Since(start) > 50*time.Millisecond {
 		t.Error("unlimited throttle slept")
+	}
+}
+
+// TestThrottleConcurrent: the copier's workers share one throttle, so
+// pacing from several goroutines must be race-free and must bound the
+// aggregate rate, not each goroutine's own.
+func TestThrottleConcurrent(t *testing.T) {
+	th := newThrottle(1 << 20) // 1 MiB/s
+	start := time.Now()
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Go(func() {
+			for range 4 {
+				th.pace(16 << 10) // 8 × 4 × 16 KiB = 512 KiB -> ~500ms owed in total
+			}
+		})
+	}
+	wg.Wait()
+	if elapsed := time.Since(start); elapsed < 400*time.Millisecond {
+		t.Errorf("concurrent pacing took %v, want ≈500ms for 512 KiB at 1 MiB/s", elapsed)
+	}
+}
+
+// TestReapParallelCopiesEveryLiveRecord pins the copier's accounting under
+// a worker pool: a forced sweep over packs holding a mix of live and dead
+// records must copy exactly the live records of every pack that has any
+// garbage — each once, none from the active segment or from all-live
+// packs — and every live object must still read back.
+func TestReapParallelCopiesEveryLiveRecord(t *testing.T) {
+	ts := newTestStore(t, 64<<10) // ~200 records per pack: real fan-out per victim
+	rootLive, liveKeys, _, _ := storeInterleavedTrees(t, ts.objects, 400)
+	c := ts.openCollector(t, Options{Grace: time.Hour, Jobs: 8})
+	putTestRef(t, c, ts.refs, "live", rootLive)
+	backdatePacks(t, ts)
+
+	isLive := make(map[key.Key]bool, len(liveKeys))
+	for _, k := range liveKeys {
+		isLive[k] = true
+	}
+	segs, err := ts.objects.Segments()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(segs) < 3 {
+		t.Fatalf("%d sealed packs, want several", len(segs))
+	}
+	var wantRecords int
+	var wantBytes int64
+	for _, seg := range segs {
+		var live, dead int
+		var liveBytes int64
+		err := ts.objects.ScanIndex(seg.ID, func(k key.Key, off uint64, slen uint32) {
+			if isLive[k] {
+				live++
+				liveBytes += 46 + int64(slen)
+			} else {
+				dead++
+			}
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if dead > 0 { // garbage > 0: reaped at the forced line
+			wantRecords += live
+			wantBytes += liveBytes
+		}
+	}
+	if wantRecords == 0 {
+		t.Fatal("no pack mixes live and dead records; the test needs interleaving")
+	}
+
+	stats, err := c.Run(context.Background(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.CopiedRecords != wantRecords || stats.CopiedBytes != wantBytes {
+		t.Errorf("copied %d records / %d bytes, want %d / %d", stats.CopiedRecords, stats.CopiedBytes, wantRecords, wantBytes)
+	}
+	for _, k := range liveKeys {
+		if _, err := ts.objects.Get(k); err != nil {
+			t.Fatalf("live object %s lost: %v", k, err)
+		}
+	}
+	// Reaped packs are gone; what remains scores clean.
+	st, err := c.Status(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.GarbageBytes != 0 {
+		t.Errorf("garbage after a forced sweep: %d bytes", st.GarbageBytes)
+	}
+}
+
+// TestReapHonoursCancellation: a cancelled context stops the copier and
+// surfaces as the context's error, not as a silent partial success.
+func TestReapHonoursCancellation(t *testing.T) {
+	ts := newTestStore(t, 64<<10)
+	root, _ := storeTree(t, ts.objects, "cx", 400)
+	c := ts.openCollector(t, Options{Grace: time.Hour, Jobs: 4})
+	putTestRef(t, c, ts.refs, "cx", root)
+	backdatePacks(t, ts)
+	segs, err := ts.objects.Segments()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, err := c.reap(ctx, c.union.Load(), segs[0].ID, newThrottle(0)); !errors.Is(err, context.Canceled) {
+		t.Errorf("reap with a cancelled context: err = %v, want context.Canceled", err)
 	}
 }
 
