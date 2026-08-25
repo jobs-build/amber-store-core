@@ -166,3 +166,59 @@ per invocation (no persistent liveness), and a crashed/aborted cycle
 redoes its mark from scratch. First-run variance on the same machine:
 simple-gc's gc passes also measured 8.3 s / 28.7 s (65/104 reaped) on a
 pristine disk, so treat ±10 % on the copy-bound numbers as noise.
+
+### Results, 2026-08-25, Linux, 150 GiB: simple-gc vs mark-sweep-gc (PR #2)
+
+Same i7-1280P, same protocol as the 50 GiB side-by-side but `-scale 3.0`:
+1000 refs, 198.98 GiB ingested, 149.41 GiB unique (24.9 % duplicate),
+105k files, 599 packs, 2.32M objects. Deleting the 700 refs leaves
+51.9 GiB nominal garbage. Dataset + store are ~3× RAM (62 GiB), so the
+page cache no longer holds the working set. simple-gc numbers are from
+the control rerun under conditions matched to the mark-sweep arm; its
+first run (fresh dataset) measured the same within noise except gc
+(policy 18.3 s, forced 61.3 s). End state is identical in all three
+runs: 149.69 → 104.4 → 97.71 GiB, 300/300 complete, 10 restores
+identical.
+
+| step | simple-gc (main) | mark-sweep (PR #2) |
+| --- | --- | --- |
+| ingest 1000 refs | 366.1 s, 556 MiB/s logical, 418 MiB/s new bytes | **282.0 s, 723 / 543 MiB/s** |
+| — of which ingest.Dir | 356.1 s | 278.9 s (see below) |
+| ref put | 9.8 ms/ref median, growing 4.4 → 14.5 over the run | **2.3 ms/ref, flat** |
+| delete 700 refs | 6.85 s (9.8 ms/ref) | **0.38 s (0.5 ms/ref)** — 17× |
+| `gc run` (0.5 line): 210 reaped, 7.3 GiB copied, 52.5 GiB freed | **14.5 s** (18.3 s first run) | 21.5 s (mark 4.6 s, sweep 16.8 s) |
+| `gc run --garbage 0`: 129–130 reaped, 25.4–25.8 GiB copied | 58.7 s (61.3 s first run) | **31.3 s** (mark 3.2 s, sweep 28.0 s) — 2× |
+| both gc passes end to end | 73.2 s | **52.8 s** |
+| packstore on disk: ingest → policy → forced | 149.69 → 104.43 → 97.71 GiB | identical |
+| liveness state | closures 25.1 MiB (1000 refs) / 14.2 MiB (300) + union in RAM | none |
+| integrity | 300/300 complete, 10 restores identical | same |
+
+How the trade moves at 3× scale. simple-gc's churn costs grow with the
+union (2.32M live tails): deletes 2.6 → 6.9 s and ref put 4.8 → 9.8 ms
+vs the 50 GiB run, both still climbing within the run; mark-sweep stays
+flat (0.4 s, 2.3 ms) — there is nothing that scales with ref count on
+its churn path. The ingest gap is larger than the timed ref-put split
+(10.0 vs 3.1 s) explains: main's ingest.Dir — identical packstore code —
+runs 77 s slower, and the remaining suspect is the per-put union merge,
+which allocates a fresh ~37 MB union per reference (~37 GB over the
+phase) and pays its concurrent-GC cost inside the ingest windows; at
+50 GiB the same comparison showed ingest.Dir dead even, so the effect
+only bites once the union is millions of entries. In the other
+direction, the mark went superlinear: 0.5 → 4.6 s for 3× objects,
+because MarkSet.locate probes pack filters newest-first across all 599
+segments — O(marked objects × packs); that flips the policy pass to
+simple-gc (14.5 vs 21.5 s), whose union scoring stays cheap. A per-key
+segment memo (or marking in disk order) is the obvious next lever if the
+mark matters at larger scales. The forced pass flips the other way,
+2× for mark-sweep (31.3 vs 58.7 s): with the cache saturated,
+simple-gc's per-8-MiB copy fsyncs under the append lock stall the
+copier, while Compact batches its fsync to the end of the sweep. One
+more scale note: Compact deletes all victims after all copies (peak
+disk = store + copied bytes, here +25 GiB transient), where simple-gc
+deletes per victim as it goes.
+
+The pack polarization at this scale is worth knowing for policy tuning:
+with 300 MiB refs against 256 MiB packs, most packs end up nearly all
+live or all dead, so the 0.5-line policy pass already frees 52.5 of the
+51.9 GiB nominal (the store's whole-pipeline picture: policy leaves just
+6.7 GiB of garbage vs 7.0–7.2 GiB at 50 GiB scale on a 3× store).
