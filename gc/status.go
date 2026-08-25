@@ -6,49 +6,84 @@ import (
 	"slices"
 	"time"
 
+	"github.com/jobs-build/amber-store-core/fstree"
 	"github.com/jobs-build/amber-store-core/key"
 	"github.com/jobs-build/amber-store-core/reference"
 )
 
-// Status is the gc report: per-pack scores against the current union and
-// horizon, totals, closure and union sizes, the last cycle. While Pending
-// is nonzero (named roots not yet walked) the scores overstate garbage;
-// the first cycle resolves it.
+// PackStatus is one sealed pack's score against a mark.
+type PackStatus struct {
+	ID       uint64
+	Sealed   time.Time
+	Body     int64 // record bytes
+	Keys     uint64
+	Live     int64 // Σ (46 + slen) over marked entries
+	Garbage  float64
+	Eligible bool // sealed before the horizon (now − grace)
+}
+
+// Status is the gc report: per-pack scores against a fresh advisory mark,
+// totals, the last cycle. The mark runs without quiescing writers, so
+// concurrent churn can skew the numbers; a cycle's own mark is exact.
 type Status struct {
 	Packs        []PackStatus
 	LiveBytes    int64
 	GarbageBytes int64
 	Refs         int // reference names
-	Closures     int // closure files on disk
-	Pending      int // named roots without a valid closure yet
-	Union        int // live tails
+	Marked       int // distinct live objects marked
 	Last         *CycleStats
 	LastError    string
 }
 
-// Status scores every pack against the current union — seconds on a large
-// store, no pack body read.
+// Status marks from the current references and scores every sealed pack —
+// a full mark walk, the cost of keeping no persistent liveness state.
 func (c *Collector) Status(ctx context.Context) (Status, error) {
-	u := c.union.Load()
-	scores, err := c.score(ctx, u, c.horizon(time.Now()))
+	recs, err := c.refs.All()
 	if err != nil {
 		return Status{}, err
 	}
-	st := Status{Packs: scores, Union: u.size()}
-	for _, p := range scores {
-		st.LiveBytes += p.Live
-		st.GarbageBytes += p.Body - p.Live
-	}
-	onDisk, err := c.d.list()
+	roots, err := c.roots()
 	if err != nil {
 		return Status{}, err
 	}
-	st.Closures = len(onDisk)
+	live, err := c.markLive(ctx, roots)
+	if err != nil {
+		return Status{}, err
+	}
+	report, err := c.objects.Liveness(live.Contains)
+	if err != nil {
+		return Status{}, err
+	}
+	segs, err := c.objects.Segments()
+	if err != nil {
+		return Status{}, err
+	}
+	sealedAt := make(map[uint64]time.Time, len(segs))
+	for _, seg := range segs {
+		sealedAt[seg.ID] = seg.Sealed
+	}
+	horizon := time.Now().Add(-c.opts.Grace)
+	st := Status{Refs: len(recs), Marked: live.Marked()}
+	for _, sl := range report {
+		if !sl.Sealed {
+			continue // the active segment is never a victim
+		}
+		ps := PackStatus{
+			ID:     sl.ID,
+			Sealed: sealedAt[sl.ID],
+			Body:   int64(sl.LiveBytes + sl.DeadBytes),
+			Keys:   uint64(sl.LiveKeys + sl.DeadKeys),
+			Live:   int64(sl.LiveBytes),
+		}
+		if ps.Body > 0 {
+			ps.Garbage = float64(sl.DeadBytes) / float64(ps.Body)
+		}
+		ps.Eligible = ps.Sealed.Before(horizon)
+		st.Packs = append(st.Packs, ps)
+		st.LiveBytes += ps.Live
+		st.GarbageBytes += int64(sl.DeadBytes)
+	}
 	c.mu.Lock()
-	for _, n := range c.roots {
-		st.Refs += n
-	}
-	st.Pending = len(c.pending)
 	st.Last = c.last
 	if c.lastErr != nil {
 		st.LastError = c.lastErr.Error()
@@ -57,15 +92,15 @@ func (c *Collector) Status(ctx context.Context) (Status, error) {
 	return st, nil
 }
 
-// Why returns the sorted names of the references whose closure holds k's
-// tail — why the object is alive.
+// Why returns the sorted names of the references whose tree reaches k —
+// why the object is alive. Each reference's tree is walked until k is
+// found; there is no persistent closure to consult.
 func (c *Collector) Why(k key.Key) ([]string, error) {
 	recs, err := c.refs.All()
 	if err != nil {
 		return nil, err
 	}
-	t := Tail(k)
-	byRoot := make(map[key.Key][]string)
+	var names []string
 	for _, r := range recs {
 		ref, err := reference.Decode(r.Data)
 		if err != nil {
@@ -75,18 +110,44 @@ func (c *Collector) Why(k key.Key) ([]string, error) {
 		if err != nil {
 			return nil, fmt.Errorf("gc: reference %q: %w", r.Name, err)
 		}
-		byRoot[root] = append(byRoot[root], r.Name)
-	}
-	var names []string
-	for root, ns := range byRoot {
-		tails, ok := c.d.read(root)
-		if !ok {
-			continue
+		found, err := c.reaches(root, k)
+		if err != nil {
+			return nil, fmt.Errorf("gc: reference %q: %w", r.Name, err)
 		}
-		if _, found := slices.BinarySearch(tails, t); found {
-			names = append(names, ns...)
+		if found {
+			names = append(names, r.Name)
 		}
 	}
 	slices.Sort(names)
 	return names, nil
+}
+
+// reaches walks root's tree until k is found, pruning revisited subtrees.
+func (c *Collector) reaches(root, k key.Key) (bool, error) {
+	visited := map[key.Key]bool{}
+	stack := []key.Key{root}
+	for len(stack) > 0 {
+		cur := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if cur == k {
+			return true, nil
+		}
+		if visited[cur] {
+			continue
+		}
+		visited[cur] = true
+		if cur.Type() == key.Blob || cur.Type() == key.XattrSet {
+			continue
+		}
+		data, err := c.objects.Get(cur)
+		if err != nil {
+			return false, err
+		}
+		children, err := fstree.ChildKeys(cur, data)
+		if err != nil {
+			return false, err
+		}
+		stack = append(stack, children...)
+	}
+	return false, nil
 }

@@ -62,8 +62,8 @@ func TestOracle(t *testing.T) {
 			}
 		}
 	}
-	// Force a full sweep and re-verify, then reopen everything and
-	// verify against a rebuilt union.
+	// Force a full sweep and re-verify, then reopen the collector and
+	// verify a fresh mark reaches the same conclusion.
 	backdatePacks(t, ts)
 	if _, err := c.Run(context.Background(), 0); err != nil {
 		t.Fatal(err)

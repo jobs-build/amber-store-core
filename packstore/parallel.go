@@ -127,6 +127,7 @@ func (s *Store) runWriter(ctx context.Context, ch <-chan Object, seen *seenSet, 
 			if !ok {
 				return flush()
 			}
+			s.observe(obj.Key)
 			if !seen.addIfAbsent(obj.Key) {
 				deduped.Add(1)
 				continue

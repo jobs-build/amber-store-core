@@ -189,66 +189,48 @@ func TestE2E_RefSetChecksCompleteness(t *testing.T) {
 	}
 }
 
-func TestE2E_RefLifecycleMaintainsClosures(t *testing.T) {
+func TestE2E_RefLifecycle(t *testing.T) {
 	src := t.TempDir()
 	writeFixture(t, src)
 	store := t.TempDir()
-	out, err := runApp(t, "--store", store, "ingest", "--no-progress", src)
+	seg := []string{"--store", store, "--segment-size", "4096"}
+	out, err := runApp(t, append(seg, "ingest", "--no-progress", src)...)
 	if err != nil {
 		t.Fatal(err)
 	}
 	root := strings.TrimSpace(out)
-	if _, err := runApp(t, "--store", store, "ref", "set", "v1", root); err != nil {
+	if _, err := runApp(t, append(seg, "ref", "set", "v1", root)...); err != nil {
 		t.Fatalf("ref set: %v", err)
 	}
-	closure := filepath.Join(store, "closures", root+".tails")
-	if _, err := os.Stat(closure); err != nil {
-		t.Errorf("no closure after ref set: %v", err)
-	}
-	// A second name shares the closure; removing one keeps it.
-	if _, err := runApp(t, "--store", store, "ref", "set", "v2", root); err != nil {
+	// A second name shares the root; removing one keeps the tree live.
+	if _, err := runApp(t, append(seg, "ref", "set", "v2", root)...); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := runApp(t, "--store", store, "ref", "rm", "v1"); err != nil {
+	if _, err := runApp(t, append(seg, "ref", "rm", "v1")...); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(closure); err != nil {
-		t.Errorf("closure gone while v2 lives: %v", err)
+	time.Sleep(50 * time.Millisecond)
+	if _, err := runApp(t, append(seg, "gc", "run", "--grace", "1ms", "--garbage", "0")...); err != nil {
+		t.Fatalf("gc run while v2 lives: %v", err)
 	}
-	if _, err := runApp(t, "--store", store, "ref", "rm", "v2"); err != nil {
+	restoreDir := t.TempDir()
+	if _, err := runApp(t, append(seg, "restore", "ref:v2", restoreDir)...); err != nil {
+		t.Fatalf("restore after gc while v2 lives: %v", err)
+	}
+	// The last rm makes the tree garbage; the next cycle collects it.
+	if _, err := runApp(t, append(seg, "ref", "rm", "v2")...); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(closure); !os.IsNotExist(err) {
-		t.Error("closure survives the last rm")
+	time.Sleep(50 * time.Millisecond)
+	if _, err := runApp(t, append(seg, "gc", "run", "--grace", "1ms", "--garbage", "0")...); err != nil {
+		t.Fatalf("gc run after last rm: %v", err)
 	}
-}
-
-func TestE2E_RefSameRootRePut(t *testing.T) {
-	src := t.TempDir()
-	writeFixture(t, src)
-	store := t.TempDir()
-	out, err := runApp(t, "--store", store, "ingest", "--no-progress", src)
+	out, err = runApp(t, append(seg, "gc", "why", root)...)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("gc why: %v", err)
 	}
-	root := strings.TrimSpace(out)
-	if _, err := runApp(t, "--store", store, "ref", "set", "v1", root); err != nil {
-		t.Fatalf("first set: %v", err)
-	}
-	// Same name, same root: the re-put must net to zero in the name count.
-	if _, err := runApp(t, "--store", store, "ref", "set", "v1", root); err != nil {
-		t.Fatalf("same-root re-put: %v", err)
-	}
-	closure := filepath.Join(store, "closures", root+".tails")
-	if _, err := os.Stat(closure); err != nil {
-		t.Fatalf("closure missing after re-put: %v", err)
-	}
-	if _, err := runApp(t, "--store", store, "ref", "rm", "v1"); err != nil {
-		t.Fatal(err)
-	}
-	// A leaked count from the re-put would leave the closure alive here.
-	if _, err := os.Stat(closure); !os.IsNotExist(err) {
-		t.Error("closure survives the only rm: the same-root re-put leaked a name count")
+	if !strings.Contains(out, "unreferenced") {
+		t.Errorf("gc why after last rm = %q, want unreferenced", out)
 	}
 }
 

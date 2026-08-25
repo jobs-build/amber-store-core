@@ -86,9 +86,9 @@ func runGCStatus(c *cli.Context) error {
 		fmt.Fprintf(w, "%016x  %-20s  %10s  %6.1f%%  %v\n",
 			p.ID, p.Sealed.Format(time.RFC3339), humanBytes(uint64(p.Body)), 100*p.Garbage, p.Eligible)
 	}
-	fmt.Fprintf(w, "live %s, garbage %s; %d refs, %d closures (%d pending), %d live tails\n",
+	fmt.Fprintf(w, "live %s, garbage %s; %d refs, %d live objects marked\n",
 		humanBytes(uint64(st.LiveBytes)), humanBytes(uint64(max(st.GarbageBytes, 0))),
-		st.Refs, st.Closures, st.Pending, st.Union)
+		st.Refs, st.Marked)
 	if st.Last != nil {
 		fmt.Fprintf(w, "last cycle: %s, %d packs scored, %d reaped, %s copied, %s freed\n",
 			st.Last.Start.Format(time.RFC3339), st.Last.Scored, len(st.Last.Reaped),
@@ -119,13 +119,10 @@ func (cfg *gcRunConfig) runGCRun(c *cli.Context) error {
 	if err != nil {
 		return err
 	}
-	if stats.Skipped {
-		fmt.Fprintln(c.App.Writer, "skipped: nothing changed since the last cycle")
-		return nil
-	}
-	fmt.Fprintf(c.App.Writer, "%d packs scored, %d reaped, %d records (%s) copied, %s freed in %s\n",
+	fmt.Fprintf(c.App.Writer, "%d packs scored, %d reaped, %d records (%s) copied, %s freed in %s (mark %s, sweep %s; %d objects marked)\n",
 		stats.Scored, len(stats.Reaped), stats.CopiedRecords,
-		humanBytes(uint64(stats.CopiedBytes)), humanBytes(uint64(max(stats.FreedBytes, 0))), stats.Duration.Round(time.Millisecond))
+		humanBytes(uint64(stats.CopiedBytes)), humanBytes(uint64(max(stats.FreedBytes, 0))), stats.Duration.Round(time.Millisecond),
+		stats.MarkDuration.Round(time.Millisecond), stats.SweepDuration.Round(time.Millisecond), stats.Marked)
 	return nil
 }
 
