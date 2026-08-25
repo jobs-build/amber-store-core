@@ -3,8 +3,9 @@ package gc
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/jobs-build/amber-store-core/fstree"
@@ -20,29 +21,21 @@ import (
 type Collector struct {
 	objects *packstore.Store
 	refs    *refstore.Store
-	d       *closureDir
+	dir     string // former closures dir: kept for layout compat and the free-space probe
 	opts    Options
 
-	// The removal lock: a reference PUT holds it shared from its first
-	// read to its commit; pack deletion holds it exclusively around the
-	// re-test and the probe-list swap.
-	removal sync.RWMutex
+	// The reference lock: a reference PUT holds it shared from its
+	// completeness walk to its commit; a cycle holds it exclusively
+	// around the roots snapshot and again around the sweep. Between the
+	// two a PUT proceeds — its walked closure joins the write barrier's
+	// grey set, so the sweep keeps it.
+	refLock sync.RWMutex
 
-	mu      sync.Mutex // guards everything below, and union swaps
-	union   atomic.Pointer[union]
-	roots   map[key.Key]int  // root -> number of reference names
-	pending map[key.Key]bool // named roots with no valid closure yet; walked before the first cycle
-	walking map[key.Key]int  // in-flight PrepareRef walks; the closure file survives while nonzero
-	leases  map[*Lease]bool
-	last    *CycleStats
-	lastErr error
-	// Cycle-skip bookkeeping: a cycle is skipped when the union, the
-	// eligible set and the line all match the previous completed cycle.
-	haveLast      bool
-	lastGen       uint64
-	lastEligible  []uint64
-	lastThreshold float64
-	cancelCycle   context.CancelFunc
+	mu          sync.Mutex // guards everything below
+	last        *CycleStats
+	lastErr     error
+	cancelCycle context.CancelFunc
+	midMark     func() // test hook: runs after the mark, before the sweep
 
 	cycleMu sync.Mutex // held for the whole cycle; cycles never overlap
 
@@ -50,74 +43,26 @@ type Collector struct {
 	done chan struct{}
 }
 
-// Open opens the collector whose closures live in dir (<store>/closures),
-// next to an already-open packstore and refstore. It sweeps tmp/, deletes
-// closures no reference names, and builds the union from the closures of
-// the references that exist; a named root without a valid closure is
-// walked before the first cycle (or by the reference write that touches
-// it). With opts.Interval > 0 a goroutine runs a cycle per interval until
-// Close.
+// Open opens the collector next to an already-open packstore and refstore.
+// dir is the layout slot the simple-gc collector kept closure files in
+// (<store>/closures): it is created empty and any leftover closure state
+// from a previous collector is swept — closures were derived data. With
+// opts.Interval > 0 a goroutine runs a cycle per interval until Close.
 func Open(dir string, objects *packstore.Store, refs *refstore.Store, opts Options) (*Collector, error) {
 	opts = opts.withDefaults()
-	d, err := openClosureDir(dir, !opts.NoSync)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return nil, fmt.Errorf("gc: creating %s: %w", dir, err)
+	}
+	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, err
 	}
-	recs, err := refs.All()
-	if err != nil {
-		d.close()
-		return nil, err
-	}
-	roots := make(map[key.Key]int, len(recs))
-	for _, r := range recs {
-		ref, err := reference.Decode(r.Data)
-		if err != nil {
-			d.close()
-			return nil, fmt.Errorf("gc: reference %q: %w", r.Name, err)
-		}
-		root, err := key.Parse(ref.Key)
-		if err != nil {
-			d.close()
-			return nil, fmt.Errorf("gc: reference %q: %w", r.Name, err)
-		}
-		roots[root]++
-	}
-	onDisk, err := d.list()
-	if err != nil {
-		d.close()
-		return nil, err
-	}
-	for _, root := range onDisk {
-		if roots[root] == 0 {
-			if err := d.remove(root); err != nil {
-				d.close()
-				return nil, err
-			}
+	for _, e := range entries {
+		if err := os.RemoveAll(filepath.Join(dir, e.Name())); err != nil {
+			return nil, fmt.Errorf("gc: sweeping stale closure state: %w", err)
 		}
 	}
-	pending := make(map[key.Key]bool)
-	var pairs []tailCount
-	for root, n := range roots {
-		tails, ok := d.read(root)
-		if !ok {
-			pending[root] = true
-			continue
-		}
-		for _, t := range tails {
-			pairs = append(pairs, tailCount{t, uint32(n)})
-		}
-	}
-	c := &Collector{
-		objects: objects,
-		refs:    refs,
-		d:       d,
-		opts:    opts,
-		roots:   roots,
-		pending: pending,
-		walking: make(map[key.Key]int),
-		leases:  make(map[*Lease]bool),
-	}
-	c.union.Store(buildUnion(pairs))
+	c := &Collector{objects: objects, refs: refs, dir: dir, opts: opts}
 	if opts.Interval > 0 {
 		ctx, cancel := context.WithCancel(context.Background())
 		c.stop = cancel
@@ -127,8 +72,8 @@ func Open(dir string, objects *packstore.Store, refs *refstore.Store, opts Optio
 	return c, nil
 }
 
-// Close stops the background loop, waits out a running cycle and releases
-// the closure directory. Close the collector before the stores under it.
+// Close stops the background loop and waits out a running cycle. Close the
+// collector before the stores under it.
 func (c *Collector) Close() error {
 	if c.stop != nil {
 		c.stop()
@@ -141,18 +86,12 @@ func (c *Collector) Close() error {
 	c.mu.Unlock()
 	c.cycleMu.Lock()
 	c.cycleMu.Unlock() //nolint:staticcheck // barrier: wait out a running cycle
-	return c.d.close()
+	return nil
 }
 
-// Wipe cancels a running cycle and empties closures/ and the union. It
-// accompanies packstore.Wipe and refstore.Wipe, which the caller runs
-// first; afterwards the collector is empty but usable.
-//
-// walking is deliberately left untouched: its entries belong to PrepareRef
-// calls currently walking a root (concurrent with this Wipe, racing the
-// caller's packstore/refstore wipe), and clearing it here would let such a
-// walk's cleanup underflow or delete a closure file out from under a
-// different in-flight walk of the same root.
+// Wipe cancels a running cycle. It accompanies packstore.Wipe and
+// refstore.Wipe, which the caller runs first; the collector itself holds
+// no state to clear.
 func (c *Collector) Wipe() error {
 	c.mu.Lock()
 	if c.cancelCycle != nil {
@@ -163,131 +102,107 @@ func (c *Collector) Wipe() error {
 	defer c.cycleMu.Unlock()
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.roots = make(map[key.Key]int)
-	c.pending = make(map[key.Key]bool)
-	c.leases = make(map[*Lease]bool)
-	c.union.Store(buildUnion(nil))
 	c.last, c.lastErr = nil, nil
-	c.haveLast = false
-	return c.d.wipe()
+	return nil
 }
 
-// walk computes root's closure: the tails of every key CheckComplete
-// visits. A missing object surfaces as the walk error — the caller's 404.
-func (c *Collector) walk(root key.Key) ([]uint64, error) {
+// PrepareRef readies a reference PUT naming root under the reference lock,
+// held shared until commit or abort: the tree is walked for completeness
+// (a missing object aborts with the error naming it — the caller's 404)
+// and the walked closure is handed to the write barrier, so a PUT landing
+// while a mark runs cannot lose its objects to the sweep. Exactly one of
+// commit (after the reference record is stored) or abort (it was not)
+// must be called. Release of an old root needs no bookkeeping; ReleaseRef
+// exists for symmetry.
+func (c *Collector) PrepareRef(root key.Key) (commit, abort func(), err error) {
+	c.refLock.RLock()
 	keys, err := fstree.CheckComplete(root, c.objects.Get, c.objects.Has, c.opts.Jobs)
 	if err != nil {
-		return nil, fmt.Errorf("gc: walking root %s: %w", root, err)
+		c.refLock.RUnlock()
+		return nil, nil, fmt.Errorf("gc: walking root %s: %w", root, err)
 	}
-	return tailsOf(keys), nil
-}
-
-// ensureClosure returns root's tails, reusing a valid closure file or
-// walking the tree and writing one.
-func (c *Collector) ensureClosure(root key.Key) ([]uint64, error) {
-	if tails, ok := c.d.read(root); ok {
-		return tails, nil
-	}
-	tails, err := c.walk(root)
-	if err != nil {
-		return nil, err
-	}
-	if err := c.d.write(root, tails); err != nil {
-		return nil, err
-	}
-	return tails, nil
-}
-
-// PrepareRef readies a reference PUT naming root under the removal lock,
-// held shared until commit or abort: the closure is reused or walked (a
-// missing object aborts with the error naming it), written durably, and
-// merged into the union. Exactly one of commit (after the reference record
-// is stored) or abort (it was not) must be called. On overwrite the caller
-// then calls ReleaseRef with the old root — including when old and new are
-// the same root.
-func (c *Collector) PrepareRef(root key.Key) (commit, abort func(), err error) {
-	c.removal.RLock()
-	// Reserve the walk: while walking[root] is nonzero a concurrent
-	// ReleaseRef of the last name keeps the closure file on disk, so the
-	// read below cannot race a removal.
-	c.mu.Lock()
-	c.walking[root]++
-	c.mu.Unlock()
-
-	tails, err := c.ensureClosure(root)
-
-	c.mu.Lock()
-	c.walking[root]--
-	if c.walking[root] == 0 {
-		delete(c.walking, root)
-	}
-	if err != nil {
-		if c.roots[root] == 0 && c.walking[root] == 0 {
-			delete(c.pending, root)
-			if rerr := c.d.remove(root); rerr != nil {
-				// A stale closure that survives here lets a later PUT skip
-				// its walk; the next Open sweeps it, but never be silent.
-				c.lastErr = fmt.Errorf("gc: removing closure for released root %s: %w", root, rerr)
-			}
-		}
-		c.mu.Unlock()
-		c.removal.RUnlock()
-		return nil, nil, err
-	}
-	delta := int32(1)
-	if c.pending[root] {
-		// The open-time union never saw this root's closure; fold the
-		// existing names in now so a later release cannot zero it out.
-		delta += int32(c.roots[root])
-		delete(c.pending, root)
-	}
-	c.roots[root]++
-	c.union.Store(c.union.Load().merge(tails, delta))
-	c.mu.Unlock()
+	c.objects.ObserveKeys(keys)
 	var once sync.Once
-	commit = func() {
-		once.Do(c.removal.RUnlock)
+	release := func() {
+		once.Do(c.refLock.RUnlock)
 	}
-	abort = func() {
-		once.Do(func() {
-			c.mu.Lock()
-			c.releaseLocked(root)
-			c.mu.Unlock()
-			c.removal.RUnlock()
-		})
-	}
-	return commit, abort, nil
+	return release, release, nil
 }
 
 // ReleaseRef records that one reference naming root was deleted or
-// overwritten: the root's tails are merged out of the union, and its
-// closure file is deleted once no reference names it. No walk.
+// overwritten. The mark-and-sweep collector keeps no per-root state, so
+// this is a no-op: the next cycle simply no longer marks from the root.
 func (c *Collector) ReleaseRef(root key.Key) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.releaseLocked(root)
+	return nil
 }
 
-func (c *Collector) releaseLocked(root key.Key) error {
-	if c.roots[root] == 0 {
-		return fmt.Errorf("gc: no reference names root %s", root)
+// roots lists the root key of every reference. The caller snapshots under
+// the reference lock when the result must be exact.
+func (c *Collector) roots() ([]key.Key, error) {
+	recs, err := c.refs.All()
+	if err != nil {
+		return nil, err
 	}
-	c.roots[root]--
-	if !c.pending[root] {
-		if tails, ok := c.d.read(root); ok {
-			c.union.Store(c.union.Load().merge(tails, -1))
-		} else {
-			// Bookkeeping hole: the union keeps this name's contribution
-			// until a restart rebuilds it. Never silent.
-			c.lastErr = fmt.Errorf("gc: closure for root %s unreadable at release; union over-counts until reopen", root)
+	roots := make([]key.Key, 0, len(recs))
+	for _, r := range recs {
+		ref, err := reference.Decode(r.Data)
+		if err != nil {
+			return nil, fmt.Errorf("gc: reference %q: %w", r.Name, err)
+		}
+		root, err := key.Parse(ref.Key)
+		if err != nil {
+			return nil, fmt.Errorf("gc: reference %q: %w", r.Name, err)
+		}
+		roots = append(roots, root)
+	}
+	return roots, nil
+}
+
+// markLive walks every root into a fresh mark set. The roots must be a
+// snapshot taken under the reference lock; the walk touches only
+// snapshot-reachable objects and runs concurrently with ingests (their
+// writes join the barrier's grey set).
+func (c *Collector) markLive(ctx context.Context, roots []key.Key) (*packstore.MarkSet, error) {
+	live := c.objects.NewMarkSet()
+	for _, root := range roots {
+		if err := c.markFrom(ctx, live, root); err != nil {
+			return nil, err
 		}
 	}
-	if c.roots[root] == 0 {
-		delete(c.roots, root)
-		delete(c.pending, root)
-		if c.walking[root] == 0 {
-			return c.d.remove(root)
+	return live, nil
+}
+
+// markFrom prunes at already-marked keys, so shared subtrees are walked
+// once. Blob and xattr payloads are marked without being read.
+func (c *Collector) markFrom(ctx context.Context, live *packstore.MarkSet, root key.Key) error {
+	stack := []key.Key{root}
+	for n := 0; len(stack) > 0; n++ {
+		if n%1024 == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 		}
+		k := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		newly, present := live.Mark(k)
+		if !present {
+			return fmt.Errorf("gc: mark: object %s missing from store", k)
+		}
+		if !newly {
+			continue
+		}
+		if k.Type() == key.Blob || k.Type() == key.XattrSet {
+			continue
+		}
+		data, err := c.objects.Get(k)
+		if err != nil {
+			return err
+		}
+		children, err := fstree.ChildKeys(k, data)
+		if err != nil {
+			return err
+		}
+		stack = append(stack, children...)
 	}
 	return nil
 }
@@ -301,12 +216,7 @@ func (c *Collector) loop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			c.runTick(ctx)
+			c.Run(ctx, -1) // errors land in Status.LastError
 		}
 	}
-}
-
-// runTick is the background cycle entry.
-func (c *Collector) runTick(ctx context.Context) {
-	c.Run(ctx, -1) // skip logic inside; errors land in Status.LastError
 }

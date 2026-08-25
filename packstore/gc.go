@@ -1,5 +1,7 @@
-// The GC surface: format-neutral views of sealed segments for the collector
-// in package gc. See architecture/simple-gc.md.
+// Format-neutral views of sealed segments: segment listing, index scans,
+// raw record reads and re-appends, removal. The mark-and-sweep collector
+// (package gc, architecture/mark-sweep-gc.md) uses Segments for its
+// status report; the rest stays as the store's generic GC surface.
 
 package packstore
 

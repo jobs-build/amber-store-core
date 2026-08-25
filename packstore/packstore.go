@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/jobs-build/amber-store-core/amberpack"
@@ -77,12 +78,18 @@ type Store struct {
 	cfg  config
 
 	appendMu sync.Mutex
-	mu       sync.RWMutex
-	sealed   []*sealedSegment // ascending id; newest last
-	active   *activeSegment   // nil until the first write of a session
-	nextID   uint64
-	closed   bool
-	failed   error // sticky write-path failure; written under appendMu+mu, read under either
+
+	// write-barrier grey capture, see barrier.go
+	capturing atomic.Bool
+	greyMu    sync.Mutex
+	grey      map[key.Key]struct{}
+
+	mu     sync.RWMutex
+	sealed []*sealedSegment // ascending id; newest last
+	active *activeSegment   // nil until the first write of a session
+	nextID uint64
+	closed bool
+	failed error // sticky write-path failure; written under appendMu+mu, read under either
 
 	// scrubMu/scrubN/scrubC track in-flight lock-free mmap walks (Verify,
 	// ScanIndex, Record): Close/Wipe/Remove wait for scrubN to reach 0 before
@@ -313,7 +320,11 @@ func (s *Store) createActive() error {
 func (s *Store) append(k key.Key, rec []byte, syncNow bool) error {
 	s.appendMu.Lock()
 	defer s.appendMu.Unlock()
+	return s.appendLocked(k, rec, syncNow)
+}
 
+// appendLocked is append's body. The caller must hold appendMu.
+func (s *Store) appendLocked(k key.Key, rec []byte, syncNow bool) error {
 	s.mu.RLock()
 	closed := s.closed
 	s.mu.RUnlock()
@@ -473,6 +484,7 @@ func (s *Store) WriteBatch(seq iter.Seq2[Object, error]) error {
 			continue
 		}
 		seen[obj.Key] = struct{}{}
+		s.observe(obj.Key)
 		has, err := s.Has(obj.Key)
 		if err != nil {
 			return fail(fmt.Errorf("exists (%s): %w", obj.Key, err))
@@ -504,6 +516,7 @@ func (s *Store) Put(k key.Key, data []byte) error {
 	if failed != nil {
 		return failed
 	}
+	s.observe(k)
 	has, err := s.Has(k)
 	if err != nil {
 		return err

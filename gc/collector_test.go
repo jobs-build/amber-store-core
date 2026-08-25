@@ -1,12 +1,13 @@
 package gc
 
 import (
+	"context"
 	"errors"
 	"hash/crc32"
 	"math/rand/v2"
 	"os"
 	"path/filepath"
-	"sync"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,7 +18,7 @@ import (
 	"github.com/jobs-build/amber-store-core/refstore"
 )
 
-// testStore is an open packstore+refstore+closureDir triple in one temp dir.
+// testStore is an open packstore+refstore pair in one temp dir.
 type testStore struct {
 	dir     string
 	objects *packstore.Store
@@ -86,8 +87,8 @@ func storeTree(t *testing.T, st *packstore.Store, seed string, n int) (key.Key, 
 	return rootObj.Key, all
 }
 
-// putRef writes a reference through the collector exactly as a CLI/daemon
-// PUT does.
+// putTestRef writes a reference through the collector exactly as a
+// CLI/daemon PUT does.
 func putTestRef(t *testing.T, c *Collector, refs *refstore.Store, name string, root key.Key) {
 	t.Helper()
 	rec := reference.Reference{Name: name, Key: root[:], CreatedAt: time.Now().UnixNano()}
@@ -125,244 +126,132 @@ func putTestRef(t *testing.T, c *Collector, refs *refstore.Store, name string, r
 	}
 }
 
-func TestPrepareRefWritesClosureAndUnion(t *testing.T) {
-	ts := newTestStore(t, 1<<20)
-	root, keys := storeTree(t, ts.objects, "one", 4)
-	c := ts.openCollector(t, Options{})
-	putTestRef(t, c, ts.refs, "v1", root)
-	// Closure file exists and holds every visited tail.
-	tails, ok := c.d.read(root)
-	if !ok {
-		t.Fatal("no closure written")
+func rmTestRef(t *testing.T, c *Collector, refs *refstore.Store, name string, root key.Key) {
+	t.Helper()
+	if err := refs.Delete(name); err != nil {
+		t.Fatal(err)
 	}
-	want := tailsOf(keys)
-	if len(tails) != len(want) {
-		t.Fatalf("closure has %d tails, want %d", len(tails), len(want))
+	if err := c.ReleaseRef(root); err != nil {
+		t.Fatal(err)
 	}
-	u := c.union.Load()
-	for _, k := range keys {
-		if !u.contains(Tail(k)) {
-			t.Errorf("union missing %s", k)
+}
+
+// backdatePacks pushes every sealed pack's mtime behind any grace period.
+func backdatePacks(t *testing.T, ts *testStore) {
+	t.Helper()
+	dir := filepath.Join(ts.dir, "packstore")
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-2 * time.Hour)
+	for _, e := range ents {
+		if strings.HasSuffix(e.Name(), ".seg") {
+			if err := os.Chtimes(filepath.Join(dir, e.Name()), old, old); err != nil {
+				t.Fatal(err)
+			}
 		}
 	}
 }
 
 func TestPrepareRefMissingObjectFails(t *testing.T) {
 	ts := newTestStore(t, 1<<20)
-	// A root whose child blob was never stored.
-	orphan, err := fstree.EncodeBlob([]byte("never-stored"))
+	c := ts.openCollector(t, Options{})
+	// A root whose child blob was never stored: the completeness walk is
+	// the caller's 404.
+	blob, err := fstree.EncodeBlob([]byte("never stored"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	rootObj, err := fstree.EncodeFileNode([]key.Key{orphan.Key})
+	rootObj, err := fstree.EncodeFileNode([]key.Key{blob.Key})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := ts.objects.Put(rootObj.Key, rootObj.Bytes); err != nil {
 		t.Fatal(err)
 	}
-	c := ts.openCollector(t, Options{})
-	_, _, err = c.PrepareRef(rootObj.Key)
-	var missing *fstree.MissingObjectError
-	if !errors.As(err, &missing) || missing.Key != orphan.Key {
-		t.Fatalf("err = %v, want MissingObjectError naming %s", err, orphan.Key)
-	}
-	if _, ok := c.d.read(rootObj.Key); ok {
-		t.Error("closure written despite failed walk")
+	if _, _, err := c.PrepareRef(rootObj.Key); err == nil {
+		t.Fatal("PrepareRef accepted a root with a missing object")
 	}
 }
 
-func TestAbortUndoes(t *testing.T) {
+func TestOpenSweepsStaleClosureState(t *testing.T) {
 	ts := newTestStore(t, 1<<20)
-	root, _ := storeTree(t, ts.objects, "ab", 3)
-	c := ts.openCollector(t, Options{})
-	commit, abort, err := c.PrepareRef(root)
-	_ = commit
+	dir := filepath.Join(ts.dir, "closures")
+	if err := os.MkdirAll(filepath.Join(dir, "tmp"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stale := filepath.Join(dir, "deadbeef.tails")
+	if err := os.WriteFile(stale, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ts.openCollector(t, Options{})
+	ents, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	abort()
-	if c.union.Load().contains(Tail(root)) {
-		t.Error("union keeps tails after abort")
-	}
-	if _, ok := c.d.read(root); ok {
-		t.Error("closure file survives abort with no names")
-	}
-	// abort after commit is a no-op (once).
-	putTestRef(t, c, ts.refs, "v1", root)
-}
-
-func TestOverwriteAndDelete(t *testing.T) {
-	ts := newTestStore(t, 1<<20)
-	root1, keys1 := storeTree(t, ts.objects, "one", 3)
-	root2, _ := storeTree(t, ts.objects, "two", 3)
-	c := ts.openCollector(t, Options{})
-	putTestRef(t, c, ts.refs, "v", root1)
-	putTestRef(t, c, ts.refs, "v", root2) // overwrite: releases root1
-	if c.union.Load().contains(Tail(keys1[0])) {
-		t.Error("overwritten root's unique tails still live")
-	}
-	if _, ok := c.d.read(root1); ok {
-		t.Error("unreferenced closure file kept")
-	}
-	if !c.union.Load().contains(Tail(root2)) {
-		t.Error("new root not live")
-	}
-	// Same-root overwrite stays balanced.
-	putTestRef(t, c, ts.refs, "v", root2)
-	if !c.union.Load().contains(Tail(root2)) {
-		t.Error("same-root overwrite lost liveness")
-	}
-	// Delete.
-	if err := ts.refs.Delete("v"); err != nil {
-		t.Fatal(err)
-	}
-	if err := c.ReleaseRef(root2); err != nil {
-		t.Fatal(err)
-	}
-	if c.union.Load().size() != 0 {
-		t.Errorf("union size %d after last delete, want 0", c.union.Load().size())
-	}
-	if _, ok := c.d.read(root2); ok {
-		t.Error("closure survives last delete")
+	if len(ents) != 0 {
+		t.Fatalf("stale closure state survived Open: %v", ents)
 	}
 }
 
-func TestTwoNamesOneRoot(t *testing.T) {
-	ts := newTestStore(t, 1<<20)
-	root, _ := storeTree(t, ts.objects, "sh", 3)
+func TestStatusScoresAndCounts(t *testing.T) {
+	ts := newTestStore(t, 4<<10)
 	c := ts.openCollector(t, Options{})
-	putTestRef(t, c, ts.refs, "a", root)
-	putTestRef(t, c, ts.refs, "b", root)
-	if err := ts.refs.Delete("a"); err != nil {
+	rootA, _ := storeTree(t, ts.objects, "a", 30)
+	rootB, keysB := storeTree(t, ts.objects, "b", 30)
+	putTestRef(t, c, ts.refs, "a", rootA)
+	putTestRef(t, c, ts.refs, "b", rootB)
+
+	st, err := c.Status(context.Background())
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := c.ReleaseRef(root); err != nil {
+	if st.Refs != 2 {
+		t.Errorf("Refs = %d, want 2", st.Refs)
+	}
+	if st.Marked == 0 {
+		t.Error("Marked = 0")
+	}
+	if st.GarbageBytes != 0 {
+		t.Errorf("GarbageBytes = %d before any delete", st.GarbageBytes)
+	}
+
+	rmTestRef(t, c, ts.refs, "b", rootB)
+	st, err = c.Status(context.Background())
+	if err != nil {
 		t.Fatal(err)
 	}
-	if !c.union.Load().contains(Tail(root)) {
-		t.Error("root died while a name still points at it")
+	if st.Refs != 1 {
+		t.Errorf("Refs = %d after delete, want 1", st.Refs)
 	}
-	if _, ok := c.d.read(root); !ok {
-		t.Error("shared closure file removed too early")
+	if st.GarbageBytes == 0 {
+		t.Error("GarbageBytes = 0 after deleting a ref with unique data")
 	}
+	_ = keysB
 }
 
-func TestOpenRebuildsAndCleans(t *testing.T) {
+func TestWhy(t *testing.T) {
 	ts := newTestStore(t, 1<<20)
-	root, keys := storeTree(t, ts.objects, "rb", 3)
-	orphanRoot, _ := storeTree(t, ts.objects, "or", 2)
 	c := ts.openCollector(t, Options{})
-	putTestRef(t, c, ts.refs, "v1", root)
-	// Plant an orphan closure (no reference names it).
-	if err := c.d.write(orphanRoot, []uint64{1, 2, 3}); err != nil {
-		t.Fatal(err)
-	}
-	if err := c.Close(); err != nil {
-		t.Fatal(err)
-	}
-	c2 := ts.openCollector(t, Options{})
-	if _, ok := c2.d.read(orphanRoot); ok {
-		t.Error("orphan closure survives open")
-	}
-	u := c2.union.Load()
-	for _, k := range keys {
-		if !u.contains(Tail(k)) {
-			t.Errorf("rebuilt union missing %s", k)
-		}
-	}
-}
+	rootA, keysA := storeTree(t, ts.objects, "a", 4)
+	rootB, _ := storeTree(t, ts.objects, "b", 4)
+	putTestRef(t, c, ts.refs, "va", rootA)
+	putTestRef(t, c, ts.refs, "vb", rootB)
 
-func TestOpenPendingResolvedByPrepareRef(t *testing.T) {
-	ts := newTestStore(t, 1<<20)
-	root, _ := storeTree(t, ts.objects, "pd", 3)
-	c := ts.openCollector(t, Options{})
-	putTestRef(t, c, ts.refs, "a", root)
-	putTestRef(t, c, ts.refs, "b", root)
-	if err := c.Close(); err != nil {
+	names, err := c.Why(keysA[0])
+	if err != nil {
 		t.Fatal(err)
 	}
-	// Corrupt the closure so the next open marks the root pending.
-	path := filepath.Join(ts.dir, "closures", root.String()+tailsSuffix)
-	if err := os.WriteFile(path, []byte("garbage"), 0o644); err != nil {
+	if len(names) != 1 || names[0] != "va" {
+		t.Fatalf("Why = %v, want [va]", names)
+	}
+	rmTestRef(t, c, ts.refs, "va", rootA)
+	names, err = c.Why(keysA[0])
+	if err != nil {
 		t.Fatal(err)
 	}
-	c2 := ts.openCollector(t, Options{})
-	if c2.union.Load().contains(Tail(root)) {
-		t.Fatal("pending root's tails in union before any walk")
-	}
-	// A third name arrives: PrepareRef must fold in the two existing names
-	// too, so one later release cannot zero the root out.
-	putTestRef(t, c2, ts.refs, "c", root)
-	if err := ts.refs.Delete("c"); err != nil {
-		t.Fatal(err)
-	}
-	if err := c2.ReleaseRef(root); err != nil {
-		t.Fatal(err)
-	}
-	if !c2.union.Load().contains(Tail(root)) {
-		t.Error("root died while names a and b still point at it")
-	}
-}
-
-func TestOpenWeighsSharedRoots(t *testing.T) {
-	ts := newTestStore(t, 1<<20)
-	root, keys := storeTree(t, ts.objects, "wr", 3)
-	c := ts.openCollector(t, Options{})
-	putTestRef(t, c, ts.refs, "a", root)
-	putTestRef(t, c, ts.refs, "b", root)
-	if err := c.Close(); err != nil {
-		t.Fatal(err)
-	}
-	c2 := ts.openCollector(t, Options{})
-	// The rebuilt union weighted the closure by both names: one release
-	// must not zero it out.
-	if err := ts.refs.Delete("a"); err != nil {
-		t.Fatal(err)
-	}
-	if err := c2.ReleaseRef(root); err != nil {
-		t.Fatal(err)
-	}
-	for _, k := range keys {
-		if !c2.union.Load().contains(Tail(k)) {
-			t.Fatalf("tail of %s died while name b still points at the root", k)
-		}
-	}
-}
-
-func TestConcurrentPrepareAndRelease(t *testing.T) {
-	ts := newTestStore(t, 1<<20)
-	root, _ := storeTree(t, ts.objects, "cc", 4)
-	c := ts.openCollector(t, Options{})
-	putTestRef(t, c, ts.refs, "keep", root) // roots stays >= 0 throughout
-	for i := 0; i < 100; i++ {
-		var wg sync.WaitGroup
-		wg.Add(2)
-		go func() {
-			defer wg.Done()
-			commit, _, err := c.PrepareRef(root)
-			if err != nil {
-				t.Error(err)
-				return
-			}
-			commit()
-		}()
-		go func() {
-			defer wg.Done()
-			if err := c.ReleaseRef(root); err != nil {
-				t.Error(err)
-			}
-		}()
-		wg.Wait()
-	}
-	// Net zero: exactly the original name remains.
-	if err := c.ReleaseRef(root); err != nil {
-		t.Fatal(err)
-	}
-	if n := c.union.Load().size(); n != 0 {
-		t.Fatalf("union holds %d tails after the last release — a merge-out was lost", n)
-	}
-	if _, ok := c.d.read(root); ok {
-		t.Error("closure file survives the last release")
+	if len(names) != 0 {
+		t.Fatalf("Why after rm = %v, want none", names)
 	}
 }
