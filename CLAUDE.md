@@ -126,3 +126,43 @@ i7-1280P despite 20 cores. Ref put and delete land near the Mac's
 numbers, not the i7's, so the Pebble `pebble.Sync` write cost here is
 APFS-like. Ingest decayed gently 615 → 562 MiB/s with per-ref maxima
 ≤ 249 ms; no stalls (dataset + packs fit the 119 GiB page cache).
+
+### Results, 2026-08-25, Linux: simple-gc vs mark-sweep-gc (PR #2)
+
+Same i7-1280P laptop as above; side-by-side of `main` (95b8542,
+simple-gc) against branch `mark-sweep-gc` (1b2e0a4, the port of Mic92's
+bitmap collector from draganm/amber-store#9), same seeded dataset. Both
+arms ran back to back with the dataset regenerated in place, so their
+page-cache/writeback conditions match each other (they are ~15 % slower
+on ingest than the pristine-disk run recorded above — a first
+simple-gc run on an empty `/tmp/bench` did ingest in 75.8 s). End state
+is identical: both reach 32.52 GiB, 300/300 complete, 10 restores
+identical.
+
+| step | simple-gc (main) | mark-sweep (PR #2) |
+| --- | --- | --- |
+| ingest 1000 refs | 92.7 s, 731 MiB/s logical, 550 MiB/s new bytes | 90.5 s, 749 / 564 MiB/s |
+| — of which ingest.Dir | 87.8 s | 88.9 s (collector-independent, as expected) |
+| ref put | 4.8 ms/ref median, growing 3.3 → 6.4 over the run | **1.4 ms/ref, flat** |
+| delete 700 refs | 2.63 s (3.8 ms/ref) | **0.37 s (0.5 ms/ref)** |
+| `gc run` (0.5 line): 63 reaped, 5.6 GiB copied, 15.8 GiB freed | 9.69 s | **6.56 s** (mark 0.52 s, sweep 5.94 s) |
+| `gc run --garbage 0`: 107 reaped, 19.4–19.5 GiB copied | 32.5 s | 29.4 s (mark 0.51 s, sweep 28.8 s) |
+| packstore on disk: ingest → policy → forced | 49.90 → 39.75 → 32.52 GiB | 49.90 → 39.75 → 32.52 GiB |
+| liveness state | closures 10.4 MiB (1000 refs) / 5.0 MiB (300) + union in RAM | none (empty dir) |
+| integrity | 300/300 complete, 10 restores identical | same |
+
+Where the differences come from: ref put loses the union merge and the
+closure-file write, keeping only the completeness walk — so it stops
+growing with the number of live refs. Delete becomes a pure refstore
+write (simple-gc paid an O(union) rebuild per release). The full mark —
+walking all 300 kept trees and marking 503,941 objects into the bitmaps
+— costs ~0.5 s (~1 µs/object), which the policy cycle more than wins
+back: its copy loop pipelines verification (CRC + payload rehash)
+across GOMAXPROCS workers with one appender and batches fsyncs at the
+end, vs simple-gc's per-8-MiB fsyncs. The forced pass is a wash — both
+are bounded by the 19.5 GiB survivor copy at the append lock. The costs
+that moved *into* the cycle: `gc status` now pays a fresh ~0.5–2 s mark
+per invocation (no persistent liveness), and a crashed/aborted cycle
+redoes its mark from scratch. First-run variance on the same machine:
+simple-gc's gc passes also measured 8.3 s / 28.7 s (65/104 reaped) on a
+pristine disk, so treat ±10 % on the copy-bound numbers as noise.
