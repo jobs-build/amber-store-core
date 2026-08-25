@@ -6,6 +6,7 @@ import (
 
 	"github.com/jobs-build/amber-store-core/chunkers"
 	"github.com/jobs-build/amber-store-core/ingest"
+	"github.com/jobs-build/amber-store-core/packstore"
 	"github.com/urfave/cli/v2"
 )
 
@@ -29,6 +30,11 @@ func newApp() *cli.App {
 				Usage:   "store directory (layout: <dir>/packstore, <dir>/refs)",
 				EnvVars: []string{"AMBER_STORE"},
 			},
+			&cli.Int64Flag{
+				Name:  "segment-size",
+				Usage: "pack segment size in bytes; the reaping granularity",
+				Value: packstore.DefaultSegmentSize,
+			},
 		},
 		Commands: []*cli.Command{
 			ingestCommand(),
@@ -36,6 +42,7 @@ func newApp() *cli.App {
 			exportCommand(),
 			restoreCommand(),
 			refCommand(),
+			gcCommand(),
 		},
 	}
 }

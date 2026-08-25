@@ -1,11 +1,14 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
+	"github.com/jobs-build/amber-store-core/gc"
 	"github.com/jobs-build/amber-store-core/key"
 	"github.com/jobs-build/amber-store-core/reference"
+	"github.com/jobs-build/amber-store-core/refstore"
 	"github.com/urfave/cli/v2"
 )
 
@@ -113,11 +116,13 @@ func runRefSet(c *cli.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := refs.Put(name, raw); err != nil {
+	coll, err := openCollector(c, objects, refs, gc.Options{})
+	if err != nil {
 		closeStore(objects, refs)
 		return err
 	}
-	return closeStore(objects, refs)
+	err = putRef(coll, refs, name, k, raw)
+	return errors.Join(err, coll.Close(), closeStore(objects, refs))
 }
 
 func runRefRm(c *cli.Context) error {
@@ -128,9 +133,71 @@ func runRefRm(c *cli.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := refs.Delete(c.Args().First()); err != nil {
+	coll, err := openCollector(c, objects, refs, gc.Options{})
+	if err != nil {
 		closeStore(objects, refs)
 		return err
 	}
-	return closeStore(objects, refs)
+	err = rmRef(coll, refs, c.Args().First())
+	return errors.Join(err, coll.Close(), closeStore(objects, refs))
+}
+
+// putRef writes a reference under the collector's removal lock: the closure
+// is reused or walked — a missing object fails the write, naming it — the
+// record is stored, and an overwritten root is released. This is the
+// optimistic reference PUT: on a 404 the caller re-sends the missing
+// objects and retries.
+//
+// Calls for one name must be serialized by the caller (the one-shot CLI
+// is); the read-old → prepare → put → release sequence is not atomic
+// against a concurrent writer of the same name.
+func putRef(coll *gc.Collector, refs *refstore.Store, name string, root key.Key, raw []byte) error {
+	var old *key.Key
+	if prev, err := refs.Get(name); err == nil {
+		prevRef, err := reference.Decode(prev)
+		if err != nil {
+			return fmt.Errorf("existing reference %q: %w", name, err)
+		}
+		k, err := key.Parse(prevRef.Key)
+		if err != nil {
+			return fmt.Errorf("existing reference %q: %w", name, err)
+		}
+		old = &k
+	} else if !errors.Is(err, refstore.ErrNotFound) {
+		return err
+	}
+	commit, abort, err := coll.PrepareRef(root)
+	if err != nil {
+		return err
+	}
+	if err := refs.Put(name, raw); err != nil {
+		abort()
+		return err
+	}
+	commit()
+	if old != nil {
+		return coll.ReleaseRef(*old)
+	}
+	return nil
+}
+
+// rmRef deletes a reference and releases its root: the tails leave the
+// union; the closure file goes if no other name shares the root. No walk.
+func rmRef(coll *gc.Collector, refs *refstore.Store, name string) error {
+	prev, err := refs.Get(name)
+	if err != nil {
+		return err
+	}
+	ref, err := reference.Decode(prev)
+	if err != nil {
+		return fmt.Errorf("reference %q: %w", name, err)
+	}
+	root, err := key.Parse(ref.Key)
+	if err != nil {
+		return fmt.Errorf("reference %q: %w", name, err)
+	}
+	if err := refs.Delete(name); err != nil {
+		return err
+	}
+	return coll.ReleaseRef(root)
 }

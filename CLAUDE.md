@@ -1,0 +1,128 @@
+# amber-store-core — project notes
+
+## Dev environment
+
+The Nix dev shell (`flake.nix`) provides `go`, `nodejs` (builds the embedded
+admin SPA via `go generate ./cmd/amber-store`), and `python3`.
+
+## Benchmarks
+
+`cmd/amber-bench` is the ingest → delete → gc benchmark; its doc comment
+describes the workload and every flag. `go test ./cmd/amber-bench` runs the
+whole pipeline at smoke scale (30 refs, 0.1× sizes, 4 MiB packs; ~8 s,
+builds the CLI itself). Full scale needs ~100 GiB of disk and a few minutes:
+
+```sh
+go build -o /tmp/amber-store ./cmd/amber-store
+go run ./cmd/amber-bench -data /tmp/bench/data -store /tmp/bench/store \
+    -restore /tmp/bench/restore -bin /tmp/amber-store -out /tmp/bench/results.json
+go run ./cmd/amber-bench -phase report -out /tmp/bench/results.json   # reprint
+```
+
+The dataset is seeded, so reruns get the identical files and pack layout;
+delete the data, store and binary afterwards.
+
+### What it measures
+
+- **Workload.** 1000 references, ~50 GiB unique: 300 "kept" refs of 100 MiB
+  fresh random data and 700 "deleted" refs of 30 MiB, interleaved (kept =
+  `i%10 < 3`). Every ref also holds whole-file reflinks of ~⅓ of its fresh
+  size from the previous ref, so ~25 % of the 66 GiB ingested is duplicate,
+  and kept refs share data with deleted neighbours. Files 256 KiB–4 MiB.
+- **Ingest rate** (in-process `ingest.Dir` + collector `PrepareRef`, as the
+  CLI/daemon do), per-ref timings, dedup counts.
+- **Delete** of the 700 refs through `ReleaseRef`.
+- **GC**: `amber-store gc run --grace 1s` under policy (0.5 garbage line),
+  then a forced `--garbage 0` pass; `gc status` and `du` around each step;
+  nominal vs really reclaimed bytes.
+- **Integrity**: `fstree.CheckComplete` on every survivor, and a sample of
+  kept refs restored through the CLI and diffed against the source.
+
+### Results, 2026-08-25 (branch `simple-gc`)
+
+Apple-silicon Mac, 14 cores, 48 GiB RAM, APFS SSD; 256 MiB segments, fsync
+on, default chunking. Dataset: 66.16 GiB ingested, 49.80 GiB unique, 24.7 %
+duplicate, 35,128 files. 200 packs after ingest.
+
+| step | sequential copier (f7821fc) | pipelined copier (f739c7d) |
+| --- | --- | --- |
+| ingest 1000 refs | 120.5 s, 562 MiB/s avg (900 MiB/s steady, then memory-pressure stalls) | 71.3 s, 950 MiB/s avg, 716 MiB/s new bytes |
+| ref put (closure walk) | 15 → 24 ms/ref over the run | 15 → 18 ms/ref |
+| delete 700 refs | 9.6 s (13.7 ms/ref) | 10.9 s (15.5 ms/ref) |
+| `gc run` (0.5 line): 199 scored, 63–64 reaped, 5.6 GiB copied, 16 GiB freed | **18.0 s** | **8.6 s** |
+| `gc run --garbage 0`: 106–107 reaped, 19.5 GiB copied, 26.6 GiB freed | **53.5 s** | **33.0 s** |
+| copier throughput | ~330–370 MiB/s | ~600–680 MiB/s |
+| packstore on disk: ingest → policy → forced | 49.96 → 39.69 → 32.52 GiB | 49.90 → 39.77 → 32.52 GiB |
+| integrity | 300/300 complete, 10 restores identical | same |
+
+What "really got deleted": the 700 refs nominally own 20.5 GiB, but 3.2 GiB
+of it stays live through the kept refs' copies (the collector reports
+garbage 17.3 GiB right after the deletes). The policy run frees ~10.2 GiB
+on disk — it deletes 16 GiB of packs but re-appends 5.6 GiB of survivors —
+and leaves 7.1 GiB of garbage in the 105 packs under the 50 % line; the
+forced pass reclaims the rest, 17.4 GiB in total (85 % of nominal), copying
+19.5 GiB to free 7.2 GiB net.
+
+Where the time goes: scoring is parallel and negligible; a cycle is the
+copy loop. With the copy pipelined across `Jobs` workers it sits at the
+same ceiling as ingest's new-byte rate — appends and `syncActive`'s fsync
+both serialize on the packstore's append lock — so the next lever is the
+fsync under that lock, not more workers. Delete cost is the union rebuild
+per `ReleaseRef`. The first run's ingest tail (stalls up to 3 s on single
+refs from ref ~600 on) was macOS memory pressure — 67 GiB of fresh source
+plus 50 GiB of mmapped packs against 48 GiB of RAM — not the store; the
+rerun did not reproduce it.
+
+### Results, 2026-08-25, Linux (branch `simple-gc`, same commit as pipelined)
+
+i7-1280P laptop (14 cores / 20 threads), 62 GiB RAM, NVMe, ext4 on
+`/tmp` (no reflinks, so gen writes the shared files as full copies —
+identical bytes, dataset just costs the full 66 GiB on disk); same
+defaults (256 MiB segments, fsync on). Seeding held: same 200 packs after
+ingest and the same on-disk trajectory 49.90 → 39.74 → 32.52 GiB.
+
+| step | Linux i7-1280P | Mac pipelined (f739c7d) |
+| --- | --- | --- |
+| ingest 1000 refs | 66.4 s, 1021 MiB/s logical, 769 MiB/s new bytes | 71.3 s, 950 / 716 MiB/s |
+| ref put (closure walk) | 3.1 → 6.6 ms/ref over the run | 15 → 18 ms/ref |
+| delete 700 refs | 2.5 s (3.6 ms/ref) | 10.9 s (15.5 ms/ref) |
+| `gc run` (0.5 line): 63 reaped, 5.6 GiB copied, 15.8 GiB freed | **6.0 s** | **8.6 s** |
+| `gc run --garbage 0`: 107 reaped, 19.5 GiB copied, 26.8 GiB freed | **20.2 s** | **33.0 s** |
+| copier throughput | ~990–1000 MiB/s | ~600–680 MiB/s |
+| integrity | 300/300 complete, 10 restores identical | same |
+
+Notably the copier runs *above* ingest's new-byte rate here (~1000 vs
+769 MiB/s) — on ext4 the fsync under the append lock is cheaper than on
+APFS, so the Mac conclusion "next lever is the fsync" is
+filesystem-dependent. Ref put and delete are 3–4× faster (Pebble writes
+with `pebble.Sync`, so the same fsync story). No memory-pressure stalls:
+ingest decayed gently
+1095 → 965 MiB/s over the run with per-ref maxima ≤ 139 ms.
+
+### Results, 2026-08-25, Linux arm64 (branch `simple-gc`, same commit)
+
+ASUS Ascent GX10 (NVIDIA GB10: 10× Cortex-X925 + 10× Cortex-A725,
+20 cores), 119 GiB RAM, NVMe, ext4 (no reflinks, full 66 GiB dataset on
+disk); same defaults. Seeding held: same dataset and 200 packs after
+ingest; the policy pass reaped 64 packs here (i7 reaped 63, Mac 63–64),
+so the mid trajectory differs slightly: 49.90 → 39.62 → 32.52 GiB.
+
+| step | GX10 (GB10 arm64) | Linux i7-1280P |
+| --- | --- | --- |
+| ingest 1000 refs | 114.7 s, 591 MiB/s logical, 445 MiB/s new bytes | 66.4 s, 1021 / 769 MiB/s |
+| ref put (closure walk) | 14.4 → 17.2 ms/ref over the run | 3.1 → 6.6 ms/ref |
+| delete 700 refs | 7.3 s (10.4 ms/ref) | 2.5 s (3.6 ms/ref) |
+| `gc run` (0.5 line): 64 reaped, 5.7 GiB copied, 16.0 GiB freed | **11.6 s** | 6.0 s (63 reaped) |
+| `gc run --garbage 0`: 106 reaped, 19.4 GiB copied, 26.5 GiB freed | **40.4 s** | 20.2 s (107 reaped) |
+| copier throughput | ~490–510 MiB/s | ~990–1000 MiB/s |
+| integrity | 300/300 complete, 10 restores identical | same |
+
+Roughly half the i7's throughput across the board, with the same shape:
+the copier again sits just above ingest's new-byte rate (~500 vs
+445 MiB/s), consistent with both serializing on the packstore append
+lock + fsync — the ceiling is per-core/fsync speed, which the GB10's
+efficiency-heavy core mix and NVMe path deliver less of than the
+i7-1280P despite 20 cores. Ref put and delete land near the Mac's
+numbers, not the i7's, so the Pebble `pebble.Sync` write cost here is
+APFS-like. Ingest decayed gently 615 → 562 MiB/s with per-ref maxima
+≤ 249 ms; no stalls (dataset + packs fit the 119 GiB page cache).

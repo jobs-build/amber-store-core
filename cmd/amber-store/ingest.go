@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"runtime"
 	"sync"
 	"time"
 
+	"github.com/jobs-build/amber-store-core/gc"
 	"github.com/jobs-build/amber-store-core/ingest"
 	"github.com/jobs-build/amber-store-core/reference"
 	"github.com/urfave/cli/v2"
@@ -119,7 +121,11 @@ func runIngest(c *cli.Context, cfg *ingestConfig) error {
 		}
 		raw, err := rec.Encode()
 		if err == nil {
-			err = refs.Put(cfg.ref, raw)
+			var coll *gc.Collector
+			coll, err = openCollector(c, objects, refs, gc.Options{})
+			if err == nil {
+				err = errors.Join(putRef(coll, refs, cfg.ref, root, raw), coll.Close())
+			}
 		}
 		if err != nil {
 			closeStore(objects, refs)

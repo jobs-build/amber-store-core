@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // runApp runs the CLI with args (without the leading program name) and
@@ -176,5 +177,157 @@ func TestE2E_MissingStoreFlag(t *testing.T) {
 	t.Setenv("AMBER_STORE", "")
 	if _, err := runApp(t, "ls", strings.Repeat("00", 32)); err == nil {
 		t.Error("expected an error without --store / $AMBER_STORE")
+	}
+}
+
+func TestE2E_RefSetChecksCompleteness(t *testing.T) {
+	store := t.TempDir()
+	// A syntactically valid key that names nothing in the store.
+	bogus := strings.Repeat("00", 32)
+	if _, err := runApp(t, "--store", store, "ref", "set", "v1", bogus); err == nil {
+		t.Error("ref set to an absent key succeeded")
+	}
+}
+
+func TestE2E_RefLifecycleMaintainsClosures(t *testing.T) {
+	src := t.TempDir()
+	writeFixture(t, src)
+	store := t.TempDir()
+	out, err := runApp(t, "--store", store, "ingest", "--no-progress", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := strings.TrimSpace(out)
+	if _, err := runApp(t, "--store", store, "ref", "set", "v1", root); err != nil {
+		t.Fatalf("ref set: %v", err)
+	}
+	closure := filepath.Join(store, "closures", root+".tails")
+	if _, err := os.Stat(closure); err != nil {
+		t.Errorf("no closure after ref set: %v", err)
+	}
+	// A second name shares the closure; removing one keeps it.
+	if _, err := runApp(t, "--store", store, "ref", "set", "v2", root); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runApp(t, "--store", store, "ref", "rm", "v1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(closure); err != nil {
+		t.Errorf("closure gone while v2 lives: %v", err)
+	}
+	if _, err := runApp(t, "--store", store, "ref", "rm", "v2"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(closure); !os.IsNotExist(err) {
+		t.Error("closure survives the last rm")
+	}
+}
+
+func TestE2E_RefSameRootRePut(t *testing.T) {
+	src := t.TempDir()
+	writeFixture(t, src)
+	store := t.TempDir()
+	out, err := runApp(t, "--store", store, "ingest", "--no-progress", src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := strings.TrimSpace(out)
+	if _, err := runApp(t, "--store", store, "ref", "set", "v1", root); err != nil {
+		t.Fatalf("first set: %v", err)
+	}
+	// Same name, same root: the re-put must net to zero in the name count.
+	if _, err := runApp(t, "--store", store, "ref", "set", "v1", root); err != nil {
+		t.Fatalf("same-root re-put: %v", err)
+	}
+	closure := filepath.Join(store, "closures", root+".tails")
+	if _, err := os.Stat(closure); err != nil {
+		t.Fatalf("closure missing after re-put: %v", err)
+	}
+	if _, err := runApp(t, "--store", store, "ref", "rm", "v1"); err != nil {
+		t.Fatal(err)
+	}
+	// A leaked count from the re-put would leave the closure alive here.
+	if _, err := os.Stat(closure); !os.IsNotExist(err) {
+		t.Error("closure survives the only rm: the same-root re-put leaked a name count")
+	}
+}
+
+func TestE2E_GC(t *testing.T) {
+	src := t.TempDir()
+	writeFixture(t, src)
+	store := t.TempDir()
+	seg := []string{"--store", store, "--segment-size", "4096"}
+
+	out, err := runApp(t, append(seg, "ingest", "--no-progress", "--ref", "v1", src)...)
+	if err != nil {
+		t.Fatalf("ingest: %v", err)
+	}
+	root1 := strings.TrimSpace(out)
+
+	// The tree changes; v1 moves on, orphaning the first tree's unique data.
+	if err := os.WriteFile(filepath.Join(src, "a.txt"), []byte(strings.Repeat("fresh content\n", 200)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err = runApp(t, append(seg, "ingest", "--no-progress", "--ref", "v1", src)...)
+	if err != nil {
+		t.Fatalf("second ingest: %v", err)
+	}
+	root2 := strings.TrimSpace(out)
+	if root1 == root2 {
+		t.Fatal("fixture change did not change the root")
+	}
+
+	// status runs and mentions the store's packs.
+	out, err = runApp(t, append(seg, "gc", "status")...)
+	if err != nil {
+		t.Fatalf("gc status: %v", err)
+	}
+	if !strings.Contains(out, "live") {
+		t.Errorf("gc status output %q missing totals", out)
+	}
+
+	// A forced run with a tiny grace reaps the dead majority. (References
+	// written by ingest --ref carry closures since the collector wiring
+	// landed; the cycle would also walk any that were missing.)
+	time.Sleep(50 * time.Millisecond) // put seals safely behind a 1ms grace
+	out, err = runApp(t, append(seg, "gc", "run", "--grace", "1ms", "--garbage", "0")...)
+	if err != nil {
+		t.Fatalf("gc run: %v", err)
+	}
+	if !strings.Contains(out, "reaped") {
+		t.Errorf("gc run output %q missing summary", out)
+	}
+
+	// why: the new root is held by v1; the old root by nobody.
+	out, err = runApp(t, append(seg, "gc", "why", root2)...)
+	if err != nil {
+		t.Fatalf("gc why: %v", err)
+	}
+	if !strings.Contains(out, "v1") {
+		t.Errorf("gc why %q missing v1", out)
+	}
+	out, err = runApp(t, append(seg, "gc", "why", root1)...)
+	if err != nil {
+		t.Fatalf("gc why old: %v", err)
+	}
+	if strings.Contains(out, "v1") {
+		t.Errorf("gc why on dead root still names v1: %q", out)
+	}
+
+	// The referenced tree is fully intact after the sweep.
+	tarPath := filepath.Join(t.TempDir(), "out.tar")
+	if _, err := runApp(t, append(seg, "export", "-o", tarPath, "ref:v1")...); err != nil {
+		t.Fatalf("export after gc: %v", err)
+	}
+	restoreDir := t.TempDir()
+	if _, err := runApp(t, append(seg, "restore", "ref:v1", restoreDir)...); err != nil {
+		t.Fatalf("restore after gc: %v", err)
+	}
+	got, err := os.ReadFile(filepath.Join(restoreDir, "a.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(string(got), "fresh content") {
+		t.Error("restored content wrong after gc")
 	}
 }
