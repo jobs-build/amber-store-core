@@ -159,3 +159,18 @@ func TestWriteBatchRecords(t *testing.T) {
 		t.Fatalf("WriteBatch of a corrupt record: err = %v, want ErrCorrupt", err)
 	}
 }
+
+// TestAppendRecordRejectsNilRecord: a nil raw must not slip through as an
+// Object carrying no Record, which prepare would take for a Data write and
+// append as an empty payload under k, quietly manufacturing an object the
+// GC copier never held.
+func TestAppendRecordRejectsNilRecord(t *testing.T) {
+	s := openStore(t, t.TempDir())
+	o := testObjects(t, 1)[0]
+	if err := s.AppendRecord(o.Key, nil); !errors.Is(err, ErrCorrupt) {
+		t.Fatalf("AppendRecord(k, nil): err = %v, want ErrCorrupt", err)
+	}
+	if has, _ := s.Has(o.Key); has {
+		t.Fatal("a nil record stored an object")
+	}
+}

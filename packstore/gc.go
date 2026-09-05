@@ -171,8 +171,13 @@ func (s *Store) HasOutside(id uint64, k key.Key) (bool, error) {
 
 // AppendRecord re-appends an already-encoded record through the normal
 // append path: no decode, no re-encode, no fsync — callers batch appends
-// and call Sync. raw must be exactly one record, CRC-valid, keyed k.
+// and call Sync. raw must be exactly one record, CRC-valid, keyed k. A nil
+// raw is rejected outright: prepare would read it as an Object carrying
+// Data instead of a Record and happily append an empty payload under k.
 func (s *Store) AppendRecord(k key.Key, raw []byte) error {
+	if raw == nil {
+		return fmt.Errorf("%w: nil record", ErrCorrupt)
+	}
 	rec, _, err := prepare(Object{Key: k, Record: raw}, false)
 	if err != nil {
 		return err
