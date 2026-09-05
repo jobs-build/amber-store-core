@@ -14,8 +14,9 @@
 // packstore writes on disk (see record.go); a wire pack is just those records
 // framed by a magic and an explicit end marker, so a truncated stream is
 // detected rather than read as a clean EOF. The Reader validates framing, CRC,
-// and key canonicality and decodes each payload; it does NOT verify the payload
-// hash — that happens in the storage path (packstore WriteParallel with Verify).
+// and key canonicality and decodes each payload (All), or hands the validated
+// records over undecoded (Records); it does NOT verify the payload hash — that
+// happens in the storage path (packstore WriteParallel with Verify).
 //
 // Versions 1 and 2 ("AMBERPK\x01" / "AMBERPK\x02") were the older uncompressed
 // and whole-stream-zstd stream formats; they are no longer produced and are
@@ -118,26 +119,40 @@ func NewReader(r io.Reader) *Reader {
 	return &Reader{r: r}
 }
 
-// All iterates over the objects in the stream. It yields exactly one error (and
-// stops) on any structural problem; on a clean stream it yields every object and
-// returns after the end marker. All must be called at most once per Reader
-// because the underlying stream position is not reset between calls.
-func (r *Reader) All() iter.Seq2[fstree.Object, error] {
-	return func(yield func(fstree.Object, error) bool) {
+// RawRecord is one record of a pack as it was read: its parsed header and
+// its complete bytes, header and stored payload, exactly as EncodeRecord
+// produced them. Bytes is caller-owned.
+type RawRecord struct {
+	Record
+	Bytes []byte
+}
+
+// Records iterates over the records in the stream without decoding them.
+// Every record is validated exactly as All validates it (framing, the
+// size bound, CRC, key canonicality) but its payload stays as stored, so
+// a consumer that appends records verbatim (packstore's Object.Record,
+// Writer.AddRecord) skips the decompress/recompress round trip; it is the
+// read-side counterpart of AddRecord. It yields exactly one error (and
+// stops) on any structural problem; on a clean stream it yields every
+// record and returns after the end marker. Records must be called at
+// most once per Reader because the underlying stream position is not
+// reset between calls.
+func (r *Reader) Records() iter.Seq2[RawRecord, error] {
+	return func(yield func(RawRecord, error) bool) {
 		br := bufio.NewReader(r.r)
 		var magic [len(packMagic)]byte
 		if _, err := io.ReadFull(br, magic[:]); err != nil {
-			yield(fstree.Object{}, fmt.Errorf("%w: reading magic: %v", ErrMalformed, err))
+			yield(RawRecord{}, fmt.Errorf("%w: reading magic: %v", ErrMalformed, err))
 			return
 		}
 		if string(magic[:]) != packMagic {
-			yield(fstree.Object{}, fmt.Errorf("%w: bad magic", ErrMalformed))
+			yield(RawRecord{}, fmt.Errorf("%w: bad magic", ErrMalformed))
 			return
 		}
 		for {
 			tag, err := br.ReadByte()
 			if err != nil {
-				yield(fstree.Object{}, fmt.Errorf("%w: truncated before end marker: %v", ErrMalformed, err))
+				yield(RawRecord{}, fmt.Errorf("%w: truncated before end marker: %v", ErrMalformed, err))
 				return
 			}
 			switch tag {
@@ -149,35 +164,54 @@ func (r *Reader) All() iter.Seq2[fstree.Object, error] {
 				var hdr [RecHeaderSize]byte
 				hdr[0] = tag
 				if _, err := io.ReadFull(br, hdr[1:]); err != nil {
-					yield(fstree.Object{}, fmt.Errorf("%w: truncated record header: %v", ErrMalformed, err))
+					yield(RawRecord{}, fmt.Errorf("%w: truncated record header: %v", ErrMalformed, err))
 					return
 				}
 				slen := binary.BigEndian.Uint32(hdr[38:42]) // stored-payload length field
 				if slen > MaxPayload {
-					yield(fstree.Object{}, fmt.Errorf("%w: record payload %d exceeds limit %d", ErrMalformed, slen, MaxPayload))
+					yield(RawRecord{}, fmt.Errorf("%w: record payload %d exceeds limit %d", ErrMalformed, slen, MaxPayload))
 					return
 				}
 				full := make([]byte, RecHeaderSize+int(slen))
 				copy(full, hdr[:])
 				if _, err := io.ReadFull(br, full[RecHeaderSize:]); err != nil {
-					yield(fstree.Object{}, fmt.Errorf("%w: truncated record payload: %v", ErrMalformed, err))
+					yield(RawRecord{}, fmt.Errorf("%w: truncated record payload: %v", ErrMalformed, err))
 					return
 				}
 				rec, err := ParseRecord(full)
 				if err != nil {
-					yield(fstree.Object{}, fmt.Errorf("%w: %v", ErrMalformed, err))
+					yield(RawRecord{}, fmt.Errorf("%w: %v", ErrMalformed, err))
 					return
 				}
-				payload, err := DecodePayload(rec.Flags, rec.Ulen, full[RecHeaderSize:])
-				if err != nil {
-					yield(fstree.Object{}, fmt.Errorf("%w: %v", ErrMalformed, err))
-					return
-				}
-				if !yield(fstree.Object{Key: rec.Key, Bytes: payload}, nil) {
+				if !yield(RawRecord{Record: rec, Bytes: full}, nil) {
 					return
 				}
 			default:
-				yield(fstree.Object{}, fmt.Errorf("%w: bad record tag %#x", ErrMalformed, tag))
+				yield(RawRecord{}, fmt.Errorf("%w: bad record tag %#x", ErrMalformed, tag))
+				return
+			}
+		}
+	}
+}
+
+// All iterates over the objects in the stream: Records with every payload
+// decoded. It yields exactly one error (and stops) on any structural
+// problem; on a clean stream it yields every object and returns after the
+// end marker. All must be called at most once per Reader because the
+// underlying stream position is not reset between calls.
+func (r *Reader) All() iter.Seq2[fstree.Object, error] {
+	return func(yield func(fstree.Object, error) bool) {
+		for raw, err := range r.Records() {
+			if err != nil {
+				yield(fstree.Object{}, err)
+				return
+			}
+			payload, err := DecodePayload(raw.Flags, raw.Ulen, raw.Bytes[RecHeaderSize:])
+			if err != nil {
+				yield(fstree.Object{}, fmt.Errorf("%w: %v", ErrMalformed, err))
+				return
+			}
+			if !yield(fstree.Object{Key: raw.Key, Bytes: payload}, nil) {
 				return
 			}
 		}
