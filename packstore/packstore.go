@@ -500,7 +500,7 @@ func (s *Store) WriteBatch(seq iter.Seq2[Object, error]) error {
 		if has {
 			continue
 		}
-		rec, err := amberpack.EncodeRecord(obj.Key, obj.Data)
+		rec, _, err := prepare(obj, false)
 		if err != nil {
 			return fail(err)
 		}

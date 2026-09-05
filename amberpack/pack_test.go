@@ -255,3 +255,121 @@ func TestReader_OversizedPayloadRejected(t *testing.T) {
 		t.Fatalf("err = %v, want ErrMalformed (oversized payload)", err)
 	}
 }
+
+// collectRecords drains Records, returning what it yielded and the error
+// that ended it.
+func collectRecords(t *testing.T, r *Reader) ([]RawRecord, error) {
+	t.Helper()
+	var out []RawRecord
+	for rec, err := range r.Records() {
+		if err != nil {
+			return out, err
+		}
+		out = append(out, rec)
+	}
+	return out, nil
+}
+
+func TestReader_Records_RoundTrip(t *testing.T) {
+	// Records yields every record's bytes exactly as EncodeRecord produced
+	// them, with its parsed header, and without decoding: a consumer that
+	// appends records verbatim (packstore's Object.Record) never touches
+	// zstd. Feeding those bytes back through AddRecord must give a stream
+	// All decodes to the original objects.
+	objs := []fstree.Object{
+		mkObj(t, []byte("alpha")),
+		mkObj(t, []byte("")),
+		mkObj(t, bytes.Repeat([]byte("amber"), 50_000)), // compressed on disk
+		mkObj(t, incompressible(4000)),
+	}
+	var buf bytes.Buffer
+	w := NewWriter(&buf)
+	want := make([][]byte, len(objs))
+	for i, o := range objs {
+		rec, err := EncodeRecord(o.Key, o.Bytes)
+		if err != nil {
+			t.Fatalf("EncodeRecord: %v", err)
+		}
+		want[i] = rec
+		if i%2 == 0 {
+			err = w.Add(o)
+		} else {
+			err = w.AddRecord(rec)
+		}
+		if err != nil {
+			t.Fatalf("add %d: %v", i, err)
+		}
+	}
+	if err := w.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	got, err := collectRecords(t, NewReader(bytes.NewReader(buf.Bytes())))
+	if err != nil {
+		t.Fatalf("Records: %v", err)
+	}
+	if len(got) != len(objs) {
+		t.Fatalf("got %d records, want %d", len(got), len(objs))
+	}
+	var again bytes.Buffer
+	w2 := NewWriter(&again)
+	for i, rec := range got {
+		if !bytes.Equal(rec.Bytes, want[i]) {
+			t.Errorf("record %d bytes differ from EncodeRecord's", i)
+		}
+		if rec.Key != objs[i].Key {
+			t.Errorf("record %d key = %s, want %s", i, rec.Key, objs[i].Key)
+		}
+		if rec.Ulen != uint32(len(objs[i].Bytes)) {
+			t.Errorf("record %d ulen = %d, want %d", i, rec.Ulen, len(objs[i].Bytes))
+		}
+		if len(rec.Bytes) != RecHeaderSize+int(rec.Slen) {
+			t.Errorf("record %d is %d bytes, header says %d", i, len(rec.Bytes), RecHeaderSize+int(rec.Slen))
+		}
+		if err := w2.AddRecord(rec.Bytes); err != nil {
+			t.Fatalf("AddRecord: %v", err)
+		}
+	}
+	if err := w2.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	decoded, err := collect(t, NewReader(&again))
+	if err != nil {
+		t.Fatalf("All over re-added records: %v", err)
+	}
+	for i, o := range objs {
+		if decoded[i].Key != o.Key || !bytes.Equal(decoded[i].Bytes, o.Bytes) {
+			t.Errorf("object %d differs after the record round trip", i)
+		}
+	}
+}
+
+func TestReader_Records_Truncated(t *testing.T) {
+	// A stream cut before the end marker is malformed for Records exactly
+	// as it is for All.
+	o := mkObj(t, []byte("alpha"))
+	rec, err := EncodeRecord(o.Key, o.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := collectRecords(t, NewReader(bytes.NewReader(wirePack(rec))))
+	if !errors.Is(err, ErrMalformed) {
+		t.Fatalf("err = %v, want ErrMalformed", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("yielded %d records before the truncation, want 1", len(got))
+	}
+}
+
+func TestReader_Records_CRCMismatch(t *testing.T) {
+	o := mkObj(t, incompressible(64))
+	rec, err := EncodeRecord(o.Key, o.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec[len(rec)-1] ^= 0x01
+	body := append(rec, tagEnd)
+	if _, err := collectRecords(t, NewReader(bytes.NewReader(wirePack(body)))); !errors.Is(err, ErrMalformed) {
+		t.Fatalf("err = %v, want ErrMalformed (record CRC mismatch)", err)
+	}
+}

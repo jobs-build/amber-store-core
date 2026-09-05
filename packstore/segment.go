@@ -30,8 +30,16 @@ var (
 // a single errors.Is target covers both record- and footer-level corruption.
 var ErrCorrupt = amberpack.ErrCorrupt
 
-// Object is one CAS object: its key and its serialized bytes.
+// Object is one CAS object to store: its key and either its serialized
+// bytes (Data) or, for an object that was encoded elsewhere, the complete
+// record as amberpack.EncodeRecord produced it (Record). Exactly one of
+// the two is set. A Record is parsed (framing, CRC, canonical key, key
+// equal to Key) and appended verbatim, so a caller that already holds
+// encoded records, say a pack it staged on disk, skips the compression
+// round trip; with WriteOpts.Verify its payload is decoded and rehashed
+// like Data is.
 type Object struct {
-	Key  key.Key
-	Data []byte
+	Key    key.Key
+	Data   []byte
+	Record []byte
 }
