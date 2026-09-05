@@ -7,7 +7,6 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/jobs-build/amber-store-core/amberpack"
 	"github.com/jobs-build/amber-store-core/key"
 	"golang.org/x/sync/errgroup"
 )
@@ -41,7 +40,9 @@ type WriteOpts struct {
 // deduplicates. The final fsync also covers dedup hits against records a
 // concurrent, uncommitted run appended. If the iterator yields
 // an error, WriteParallel stops and returns it. With opts.Verify, a
-// key/payload mismatch stops the run with a wrapped ErrVerify.
+// key/payload mismatch stops the run with a wrapped ErrVerify. An Object may
+// carry a pre-encoded Record instead of Data; it is validated and appended
+// as is (see Object).
 func (s *Store) WriteParallel(seq iter.Seq2[Object, error], opts WriteOpts) (WriteStats, error) {
 	w := s.beginWrite()
 	defer s.endWrite(w)
@@ -131,12 +132,7 @@ func (s *Store) runWriter(ctx context.Context, ch <-chan Object, seen *seenSet, 
 				deduped.Add(1)
 				continue
 			}
-			if verify {
-				if err := verifyObject(obj); err != nil {
-					return err
-				}
-			}
-			rec, err := amberpack.EncodeRecord(obj.Key, obj.Data)
+			rec, ulen, err := prepare(obj, verify)
 			if err != nil {
 				return err
 			}
@@ -144,7 +140,7 @@ func (s *Store) runWriter(ctx context.Context, ch <-chan Object, seen *seenSet, 
 				return err
 			}
 			stored.Add(1)
-			bytesStored.Add(int64(len(obj.Data)))
+			bytesStored.Add(ulen)
 			pending += len(rec)
 			if pending >= batchSize {
 				pending = 0

@@ -173,17 +173,11 @@ func (s *Store) HasOutside(id uint64, k key.Key) (bool, error) {
 // append path: no decode, no re-encode, no fsync — callers batch appends
 // and call Sync. raw must be exactly one record, CRC-valid, keyed k.
 func (s *Store) AppendRecord(k key.Key, raw []byte) error {
-	rec, err := amberpack.ParseRecord(raw)
+	rec, _, err := prepare(Object{Key: k, Record: raw}, false)
 	if err != nil {
 		return err
 	}
-	if rec.Key != k {
-		return fmt.Errorf("%w: record key %s does not match %s", ErrCorrupt, rec.Key, k)
-	}
-	if len(raw) != amberpack.RecHeaderSize+int(rec.Slen) {
-		return fmt.Errorf("%w: record is %d bytes, want %d", ErrCorrupt, len(raw), amberpack.RecHeaderSize+int(rec.Slen))
-	}
-	return s.append(k, raw, false)
+	return s.append(k, rec, false)
 }
 
 // Sync fsyncs the active segment, making every append so far durable —
